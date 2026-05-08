@@ -204,23 +204,7 @@ export default function SettingsPanel() {
         </div>
 
         <div className="space-y-4">
-          <div className="rounded-lg bg-blue-50 border border-blue-100 px-4 py-3 text-sm text-blue-900">
-            <p className="font-medium mb-1">MoySklad Marketplace (tavsiya)</p>
-            <p className="text-blue-800/90 text-xs mb-3">
-              Rasmiy ilova orqali xavfsiz ulanish. Tugmani bosing, MoySkladda ruxsat bering — qaytib kelgach
-              ulanish yangilanadi.
-            </p>
-            <button
-              type="button"
-              onClick={handleMoySkladMarketplaceOAuth}
-              className="flex items-center gap-2 px-4 py-2 bg-blue-700 hover:bg-blue-800 text-white rounded-lg text-sm font-medium transition-colors"
-            >
-              <Globe className="w-4 h-4" />
-              MoySklad orqali ulash (OAuth)
-            </button>
-          </div>
-
-          <p className="text-xs text-slate-500 border-t border-slate-100 pt-4">
+          <p className="text-xs text-slate-500">
             Yoki qo‘lda access token kiriting (JSON dagi <code className="bg-slate-100 px-1 rounded">access_token</code>{' '}
             qiymati):
           </p>
