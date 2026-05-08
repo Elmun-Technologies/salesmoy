@@ -155,15 +155,21 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("🗄️  Database initialized")
 
-    # Start background sync tasks
-    tasks = [
-        asyncio.create_task(stock_sync_loop()),
-        asyncio.create_task(debt_sync_loop()),
-        asyncio.create_task(client_sync_loop()),
-        asyncio.create_task(order_sync_loop()),
-    ]
+    # Background sync — TEST_MODE=true bo'lsa o'chiriladi (xavfsiz test uchun)
+    import os
+    test_mode = os.getenv("TEST_MODE", "false").lower() == "true"
 
-    logger.info("📡 Background sync started for all tenants (stock, debts, clients, orders)")
+    if test_mode:
+        tasks = []
+        logger.info("🧪 TEST MODE — background sync o'chirilgan, qo'lda test qiling")
+    else:
+        tasks = [
+            asyncio.create_task(stock_sync_loop()),
+            asyncio.create_task(debt_sync_loop()),
+            asyncio.create_task(client_sync_loop()),
+            asyncio.create_task(order_sync_loop()),
+        ]
+        logger.info("📡 Background sync started for all tenants (stock, debts, clients, orders)")
 
     yield
 
