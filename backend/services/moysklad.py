@@ -20,9 +20,9 @@ class MoySkladError(Exception):
 class MoySkladClient:
     """HTTP client for MoySklad API."""
 
-    def __init__(self):
+    def __init__(self, token: str = ""):
         self.base_url = settings.moysklad_base_url
-        self.token = settings.moysklad_token
+        self.token = token or settings.moysklad_token
         self.headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",

@@ -33,9 +33,7 @@ class SyncService:
     async def init_clients(self):
         """Initialize API clients with tenant credentials."""
         if self.tenant.moysklad_access_token:
-            self.ms = MoySkladClient()
-            self.ms.token = self.tenant.moysklad_access_token
-            self.ms.headers["Authorization"] = f"Bearer {self.tenant.moysklad_access_token}"
+            self.ms = MoySkladClient(token=self.tenant.moysklad_access_token)
 
         if self.tenant.salesdoctor_token and self.tenant.salesdoctor_user_id:
             self.sd = SalesDoctorClient(
