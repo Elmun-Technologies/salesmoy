@@ -111,22 +111,36 @@ class MoySkladClient:
         return rows[0] if rows else None
 
     async def get_stock(self, warehouse_id: Optional[str] = None) -> List[Dict]:
-        """Get stock report."""
-        params = {"limit": 1000}
-        if warehouse_id:
-            params["filter"] = f"warehouse={warehouse_id}"
-        data = await self._request("GET", "/report/stock/all", params=params)
-        return data.get("rows", [])
+        """Get all stock rows with pagination."""
+        all_rows: List[Dict] = []
+        offset = 0
+        limit = 1000
+        while True:
+            params: Dict[str, Any] = {"limit": limit, "offset": offset}
+            if warehouse_id:
+                params["filter"] = f"warehouse={warehouse_id}"
+            data = await self._request("GET", "/report/stock/all", params=params)
+            rows = data.get("rows", [])
+            all_rows.extend(rows)
+            total = data.get("meta", {}).get("size", 0)
+            offset += len(rows)
+            if not rows or offset >= total:
+                break
+        return all_rows
 
     # ========== Customer Orders ==========
 
     async def get_customer_orders(
-        self, status: Optional[str] = None, limit: int = 100, expand: bool = False
+        self, status: Optional[str] = None, limit: int = 100, expand: bool = False,
+        days_back: int = 90,
     ) -> List[Dict]:
-        """Get customer orders."""
-        params = {"limit": limit}
+        """Get customer orders from the last days_back days."""
+        from datetime import datetime, timedelta
+        since = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d %H:%M:%S")
+        filters = [f"moment>{since}"]
         if status:
-            params["filter"] = f"state.name={status}"
+            filters.append(f"state.name={status}")
+        params: Dict[str, Any] = {"limit": limit, "filter": ";".join(filters)}
         if expand:
             params["expand"] = "agent,state,positions"
         data = await self._request("GET", "/entity/customerorder", params=params)

@@ -252,7 +252,7 @@ class SyncService:
         client_phone = agent_data.get("phone", "") or agent_data.get("actualPhone", "")
 
         order_name = ms_order.get("name", ms_id[:8])
-        total = ms_order.get("sum", 0) / 100
+        total = ms_order.get("sum", 0)  # order API returns in currency units
         description = ms_order.get("description", "")
         state_name = ms_order.get("state", {}).get("name", "Новый") if isinstance(ms_order.get("state"), dict) else "Новый"
 
@@ -266,7 +266,7 @@ class SyncService:
                     "name": assortment.get("name", ""),
                     "sku": assortment.get("code", ""),
                     "qty": pos.get("quantity", 1),
-                    "price": pos.get("price", 0) / 100,
+                    "price": pos.get("price", 0),  # order API returns in currency units
                 })
 
         status_map = {
@@ -453,7 +453,7 @@ class SyncService:
                     return None
                 positions.append({
                     "quantity": qty,
-                    "price": item.get("price", 0) * 100,
+                    "price": item.get("price", 0),
                     "assortment": {"meta": product.get("meta")},
                 })
 
@@ -554,9 +554,31 @@ class SyncService:
         SyncService._last_product_sync[self.tenant.id] = datetime.utcnow()
 
         try:
-            ms_products = await self.ms.get_products(limit=1000)
+            # Fetch all products with pagination
+            ms_products: List[Dict] = []
+            offset = 0
+            while True:
+                page = await self.ms.get_products(limit=1000, offset=offset)
+                if not page:
+                    break
+                ms_products.extend(page)
+                offset += len(page)
+                if len(page) < 1000:
+                    break
+
             if not ms_products:
                 return
+
+            # Get SD unit for "Штук" (pieces) to attach to each product
+            sd_unit: Dict = {}
+            try:
+                unit_result = await self.sd._rpc("getUnit", {})
+                units = unit_result.get("unit", []) if isinstance(unit_result, dict) else []
+                shtuk = next((u for u in units if "штук" in u.get("name", "").lower()), None)
+                if shtuk:
+                    sd_unit = {"SD_id": shtuk["SD_id"]}
+            except Exception:
+                pass
 
             sd_products = []
             for p in ms_products:
@@ -564,7 +586,7 @@ class SyncService:
                 name = p.get("name", "")
                 if not code or not name:
                     continue
-                sd_products.append({
+                prod: Dict = {
                     "CS_id": "",
                     "SD_id": "",
                     "code_1C": code,
@@ -572,11 +594,14 @@ class SyncService:
                     "active": 1,
                     "sort": 500,
                     "volume": p.get("volume", 0.0),
-                    "packQuantity": p.get("buyPrice", {}).get("value", 1.0) if isinstance(p.get("buyPrice"), dict) else 1.0,
+                    "packQuantity": 1.0,
                     "barCode": "",
                     "weight": p.get("weight", 0.0),
                     "part_number": "",
-                })
+                }
+                if sd_unit:
+                    prod["unit"] = sd_unit
+                sd_products.append(prod)
 
             # Send in batches of 100
             batch_size = 100
@@ -591,6 +616,44 @@ class SyncService:
 
         except Exception as e:
             logger.warning("sync_products_to_salesdoctor failed: %s", e)
+
+    async def _ensure_sd_warehouses(self, ms_wh_codes: List[str]):
+        """Register MoySklad warehouse codes in Sales Doctor.
+
+        SD warehouses start with code_1C=null. This sets the code_1C so that
+        setStock calls can find the warehouse by code.
+        """
+        if not self.sd:
+            return
+        try:
+            result = await self.sd._rpc("getWarehouse", {})
+            sd_warehouses = result.get("warehouse", []) if isinstance(result, dict) else []
+            if not sd_warehouses:
+                return
+
+            # Map existing SD warehouses: code_1C → warehouse dict
+            by_code = {w.get("code_1C"): w for w in sd_warehouses if w.get("code_1C")}
+
+            to_update = []
+            for wh_code in ms_wh_codes:
+                if wh_code not in by_code:
+                    # Assign this code to the first unassigned SD warehouse
+                    for w in sd_warehouses:
+                        if not w.get("code_1C"):
+                            to_update.append({
+                                "CS_id": w.get("CS_id", ""),
+                                "SD_id": w.get("SD_id", ""),
+                                "code_1C": wh_code,
+                                "name": w.get("name", "Основной склад"),
+                                "active": "Y",
+                            })
+                            by_code[wh_code] = w
+                            break
+
+            if to_update:
+                await self.sd._rpc("setWarehouse", {"warehouse": to_update})
+        except Exception as e:
+            logger.warning("SD warehouse setup failed: %s", e)
 
     # ========== Stock Sync ==========
 
@@ -617,7 +680,7 @@ class SyncService:
                     continue
                 name = row.get("name", "")
                 qty = row.get("stock", 0)
-                price = row.get("salePrice", 0) / 100
+                price = row.get("salePrice", 0)  # stock report returns in currency units
                 store = row.get("store", {})
                 warehouse = store.get("name", "Основной склад")
                 warehouse_id = store.get("id", "")
@@ -666,6 +729,10 @@ class SyncService:
 
             await self.db.commit()
 
+            # Ensure SD warehouses are registered with proper code_1C
+            if self.sd and wh_products:
+                await self._ensure_sd_warehouses(list(wh_products.keys()))
+
             # Ensure products exist in SD before pushing stock
             if self.sd and wh_products:
                 await self.sync_products_to_salesdoctor()
@@ -698,108 +765,100 @@ class SyncService:
     # ========== Debt Sync ==========
 
     async def sync_debts(self):
-        """Sync debt information from MoySklad."""
+        """Sync debt information from MoySklad bulk report.
+
+        Uses /report/counterparty (bulk) instead of per-counterparty calls
+        to avoid rate-limiting. Batches all SD balance updates into one call.
+        """
         if not self.ms:
             return
 
         try:
-            counterparties = await self.ms.get_counterparties()
+            # Bulk report — one call instead of N per counterparty
+            all_rows: List[Dict] = []
+            offset = 0
+            while True:
+                data = await self.ms._request(
+                    "GET", "/report/counterparty",
+                    params={"limit": 1000, "offset": offset}
+                )
+                rows = data.get("rows", [])
+                all_rows.extend(rows)
+                total = data.get("meta", {}).get("size", 0)
+                offset += len(rows)
+                if not rows or offset >= total:
+                    break
+
             synced = 0
+            sd_balances: List[Dict] = []
 
-            for cp in counterparties:
-                cp_id = cp.get("id")
+            for row in all_rows:
+                cp = row.get("counterparty", {})
+                cp_id = cp.get("id", "")
                 name = cp.get("name", "")
-                phone = cp.get("phone", "")
+                phone = (cp.get("phone") or "").strip()
 
-                try:
-                    report = await self.ms.get_counterparty_report(cp_id)
-                    debt_data = report.get("rows", [{}])[0] if report.get("rows") else {}
+                remaining = row.get("balance", 0) or 0
+                total_debt = row.get("debt") or 0
+                paid = row.get("paid") or 0
 
-                    total_debt = debt_data.get("debt", 0)
-                    paid = debt_data.get("paid", 0)
-                    remaining = debt_data.get("balance", total_debt - paid)
-
-                    result = await self.db.execute(
-                        select(DebtRecord).where(
-                            DebtRecord.tenant_id == self.tenant.id,
-                            DebtRecord.client_phone == phone
-                        )
+                result = await self.db.execute(
+                    select(DebtRecord).where(
+                        DebtRecord.tenant_id == self.tenant.id,
+                        DebtRecord.client_phone == phone,
                     )
-                    record = result.scalar_one_or_none()
+                )
+                record = result.scalar_one_or_none()
 
-                    if record:
-                        record.total_debt = total_debt
-                        record.paid = paid
-                        record.remaining = remaining
-                        record.updated_at = datetime.utcnow()
-                    else:
-                        record = DebtRecord(
-                            tenant_id=self.tenant.id,
-                            client_name=name,
-                            client_phone=phone,
-                            total_debt=total_debt,
-                            paid=paid,
-                            remaining=remaining,
-                        )
-                        self.db.add(record)
-
-                    client_result = await self.db.execute(
-                        select(Client).where(
-                            Client.tenant_id == self.tenant.id,
-                            Client.phone == phone
-                        )
+                if record:
+                    record.total_debt = total_debt
+                    record.paid = paid
+                    record.remaining = remaining
+                    record.updated_at = datetime.utcnow()
+                else:
+                    record = DebtRecord(
+                        tenant_id=self.tenant.id,
+                        client_name=name,
+                        client_phone=phone,
+                        total_debt=total_debt,
+                        paid=paid,
+                        remaining=remaining,
                     )
-                    client = client_result.scalar_one_or_none()
-                    if client:
-                        client.debt = remaining
-                        client.total_paid = paid
+                    self.db.add(record)
 
-                    if self.sd and phone:
-                        try:
-                            # Update current balance (shows debt in SD)
-                            await self.sd.set_current_balance([{
-                                "CS_id": "",
-                                "SD_id": "",
-                                "code_1C": phone,
-                                "balance": remaining,
-                                "paymentType": {
-                                    "CS_id": "",
-                                    "SD_id": "",
-                                    "code_1C": "Наличные",
-                                },
-                            }])
-                            # If payment received (paid > 0), record as income transaction
-                            if paid > 0:
-                                await self.sd.set_consumption([{
-                                    "CS_id": "",
-                                    "SD_id": "",
-                                    "code_1C": f"pay-{phone}-{cp_id[:8]}",
-                                    "name": f"Тўлов: {name}",
-                                    "date": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
-                                    "comment": f"MoySkladdan синхрон",
-                                    "summa": paid,
-                                    "type": "income",
-                                    "paymentType": {
-                                        "CS_id": "",
-                                        "SD_id": "",
-                                        "code_1C": "Наличные",
-                                    },
-                                    "cashbox": {
-                                        "CS_id": "",
-                                        "SD_id": "",
-                                        "code_1C": "",
-                                    },
-                                }])
-                        except Exception as e:
-                            logger.warning("SalesDoctor Касса sync failed: %s", e)
+                client_result = await self.db.execute(
+                    select(Client).where(
+                        Client.tenant_id == self.tenant.id,
+                        Client.phone == phone,
+                    )
+                )
+                client = client_result.scalar_one_or_none()
+                if client:
+                    client.debt = remaining
+                    client.total_paid = paid
 
-                    synced += 1
+                if phone and remaining != 0:
+                    sd_balances.append({
+                        "CS_id": "",
+                        "SD_id": "",
+                        "code_1C": phone,
+                        "balance": remaining,
+                        "paymentType": {"CS_id": "", "SD_id": "", "code_1C": "Наличные"},
+                    })
 
-                except Exception as e:
-                    logger.warning(f"Report failed for {name}: {e}")
-                    continue
+                synced += 1
 
             await self.db.commit()
+
+            # Single batched call to SD (avoids 429 rate limit)
+            if self.sd and sd_balances:
+                try:
+                    batch_size = 100
+                    for i in range(0, len(sd_balances), batch_size):
+                        await self.sd.set_current_balance(sd_balances[i:i + batch_size])
+                except Exception as e:
+                    logger.warning("SalesDoctor balance sync failed: %s", e)
+
             await self.log(LogType.SUCCESS, "Debt Sync", f"Synced debts for {synced} clients")
 
         except Exception as e:

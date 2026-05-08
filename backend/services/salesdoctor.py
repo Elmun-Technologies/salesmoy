@@ -80,7 +80,12 @@ class SalesDoctorClient:
             result = resp.json() if resp.content else {}
             if isinstance(result, dict) and result.get("status") is False:
                 err = result.get("error") or {}
-                raise SalesDoctorError(err.get("message") or result.get("message", "Unknown error"))
+                inner = result.get("result") or {}
+                completed = inner.get("completed", 0) if isinstance(inner, dict) else 0
+                if completed == 0:
+                    raise SalesDoctorError(err.get("message") or result.get("message", "Unknown error"))
+                # Partial success: some items processed, log warning but don't raise
+                logger.warning("SD partial error in %s: %s", method, err.get("message"))
             return result.get("result", result) if isinstance(result, dict) else result
         except httpx.HTTPStatusError as e:
             logger.error("SalesDoctor HTTP %s: %s", e.response.status_code, e.response.text)
