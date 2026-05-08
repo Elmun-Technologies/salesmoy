@@ -611,14 +611,16 @@ class SyncService:
             wh_products: Dict[str, List[Dict]] = {}
 
             for row in stock_rows:
-                sku = row.get("code", "")
+                ms_id = row.get("id", "")
+                sku = row.get("code", "") or ms_id  # fallback to MS id if no SKU
+                if not sku:
+                    continue
                 name = row.get("name", "")
                 qty = row.get("stock", 0)
                 price = row.get("salePrice", 0) / 100
                 store = row.get("store", {})
                 warehouse = store.get("name", "Основной склад")
                 warehouse_id = store.get("id", "")
-                # Use MoySklad store ID as code_1C for the warehouse in SD
                 wh_code = store.get("externalCode") or warehouse_id or "main"
 
                 if qty > 0 and qty <= 5:
@@ -637,11 +639,12 @@ class SyncService:
                     item.price = price
                     item.name = name
                     item.warehouse = warehouse
+                    item.moysklad_id = ms_id
                     item.last_sync = datetime.utcnow()
                 else:
                     item = StockItem(
                         tenant_id=self.tenant.id,
-                        moysklad_id=row.get("id"),
+                        moysklad_id=ms_id,
                         sku=sku,
                         name=name,
                         qty=qty,
