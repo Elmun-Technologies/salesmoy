@@ -68,11 +68,20 @@ class MoySkladClient:
 
     # ========== Counterparty (Clients) ==========
 
-    async def get_counterparties(self, phone: Optional[str] = None) -> List[Dict]:
-        """Get all counterparties or filter by phone."""
-        params = {"limit": 100}
+    async def get_counterparties(
+        self, phone: Optional[str] = None, days_back: Optional[int] = None
+    ) -> List[Dict]:
+        """Get counterparties, optionally filtered by phone or recently updated."""
+        from datetime import datetime, timedelta
+        params: Dict[str, Any] = {"limit": 100}
+        filters = []
         if phone:
-            params["filter"] = f"phone={phone}"
+            filters.append(f"phone={phone}")
+        if days_back is not None:
+            since = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d %H:%M:%S")
+            filters.append(f"updated>{since}")
+        if filters:
+            params["filter"] = ";".join(filters)
         data = await self._request("GET", "/entity/counterparty", params=params)
         return data.get("rows", [])
 

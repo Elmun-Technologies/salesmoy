@@ -22,7 +22,7 @@ class SyncService:
 
     # Class-level: tracks last product sync time per tenant to avoid spamming SD
     _last_product_sync: Dict[int, datetime] = {}
-    PRODUCT_SYNC_INTERVAL_SECONDS = 3600  # sync products to SD once per hour max
+    PRODUCT_SYNC_INTERVAL_SECONDS = 86400  # sync products to SD once per day max
 
     def __init__(self, db: AsyncSession, tenant: Tenant):
         self.db = db
@@ -143,12 +143,16 @@ class SyncService:
             return None
 
     async def sync_clients_from_moysklad(self):
-        """Pull all clients from MoySklad to local DB, merging duplicates by phone."""
+        """Pull recently updated clients from MoySklad to local DB.
+
+        Only fetches clients updated in the last 24 hours. Initial full import
+        is not done automatically — only new/changed clients are synced.
+        """
         if not self.ms:
             return
 
         try:
-            counterparties = await self.ms.get_counterparties()
+            counterparties = await self.ms.get_counterparties(days_back=1)
             synced = 0
             merged = 0
 
@@ -328,17 +332,17 @@ class SyncService:
         return order
 
     async def sync_orders_from_moysklad(self):
-        """Pull recent orders from MoySklad, save new ones to DB and push to Sales Doctor.
+        """Pull today's new orders from MoySklad → Sales Doctor.
 
-        Fetches the order list first (no expand), then fetches positions individually
-        only for orders not yet in DB — avoids MoySklad list-expand limitations.
+        Only fetches orders from the last 24 hours. Historical orders are not
+        imported automatically — they can be synced on demand if the client requests.
         """
         if not self.ms:
             return
 
         try:
-            # Get basic order list (no expand — list endpoint doesn't reliably expand positions)
-            ms_orders = await self.ms.get_customer_orders(limit=100, expand=False)
+            # Only last 24 hours — no historical import
+            ms_orders = await self.ms.get_customer_orders(limit=100, expand=False, days_back=1)
             synced = 0
 
             for ms_order_brief in ms_orders:
