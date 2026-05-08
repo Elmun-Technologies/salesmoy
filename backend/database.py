@@ -76,6 +76,8 @@ async def _patch_schema():
 
 async def init_db():
     """Initialize database tables."""
+    # Import all models so Base.metadata knows about them
+    import models  # noqa: F401
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await _patch_schema()

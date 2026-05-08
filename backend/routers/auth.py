@@ -360,5 +360,7 @@ async def get_current_user(request: Request, db: AsyncSession = Depends(get_db))
             "trial_ends_at": tenant.trial_ends_at.isoformat() if tenant.trial_ends_at else None,
             "moysklad_connected": bool(tenant.moysklad_access_token),
             "salesdoctor_connected": bool(tenant.salesdoctor_token),
+            "salesdoctor_base_url": tenant.salesdoctor_base_url or "",
+            "salesdoctor_login": tenant.salesdoctor_login or "",
         }
     }

@@ -36,12 +36,17 @@ class SalesDoctorError(Exception):
 class SalesDoctorClient:
     """HTTP client for Sales Doctor JSON-RPC API v2."""
 
+    HEADERS = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (compatible; SalesMoy-Integration/1.0)",
+    }
+
     def __init__(self, base_url: str, user_id: str, token: str, filial_id: int = 0):
         self.base_url = base_url.rstrip("/") + "/"
         self.user_id = user_id
         self.token = token
         self.filial_id = filial_id
-        self._http = httpx.AsyncClient(timeout=30.0)
+        self._http = httpx.AsyncClient(timeout=30.0, headers=self.HEADERS)
 
     async def close(self):
         await self._http.aclose()
@@ -73,9 +78,10 @@ class SalesDoctorClient:
             )
             resp.raise_for_status()
             result = resp.json() if resp.content else {}
-            if isinstance(result, dict) and result.get("status") == "error":
-                raise SalesDoctorError(result.get("message", "Unknown error"))
-            return result
+            if isinstance(result, dict) and result.get("status") is False:
+                err = result.get("error") or {}
+                raise SalesDoctorError(err.get("message") or result.get("message", "Unknown error"))
+            return result.get("result", result) if isinstance(result, dict) else result
         except httpx.HTTPStatusError as e:
             logger.error("SalesDoctor HTTP %s: %s", e.response.status_code, e.response.text)
             raise SalesDoctorError(f"HTTP {e.response.status_code}: {e.response.text}")
@@ -97,20 +103,22 @@ class SalesDoctorClient:
             "method": "login",
             "auth": {"login": login, "password": password},
         }
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; SalesMoy-Integration/1.0)",
+        }
         async with httpx.AsyncClient(timeout=30.0) as http:
             try:
-                resp = await http.post(
-                    url,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                )
+                resp = await http.post(url, json=payload, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
-                if data.get("status") == "error":
-                    raise SalesDoctorError(data.get("message", "Login failed"))
-                if not data.get("userId") or not data.get("token"):
+                if data.get("status") is False:
+                    err = data.get("error") or {}
+                    raise SalesDoctorError(err.get("message") or "Login failed")
+                result = data.get("result", data)
+                if not result.get("userId") or not result.get("token"):
                     raise SalesDoctorError(f"Login response missing userId/token: {data}")
-                return {"userId": str(data["userId"]), "token": str(data["token"])}
+                return {"userId": str(result["userId"]), "token": str(result["token"])}
             except httpx.HTTPStatusError as e:
                 raise SalesDoctorError(f"Login HTTP {e.response.status_code}: {e.response.text}")
             except httpx.RequestError as e:

@@ -57,7 +57,10 @@ export default function SettingsPanel() {
 
   // Connection inputs
   const [msToken, setMsToken] = useState('');
-  const [sdKey, setSdKey] = useState('');
+  const [sdBaseUrl, setSdBaseUrl] = useState('');
+  const [sdLogin, setSdLogin] = useState('');
+  const [sdPassword, setSdPassword] = useState('');
+  const [sdFilialId, setSdFilialId] = useState('0');
 
   useEffect(() => {
     async function load() {
@@ -68,6 +71,8 @@ export default function SettingsPanel() {
           getBillingStatus(),
         ]);
         setTenant(me.tenant);
+        if (me.tenant?.salesdoctor_base_url) setSdBaseUrl(me.tenant.salesdoctor_base_url);
+        if (me.tenant?.salesdoctor_login) setSdLogin(me.tenant.salesdoctor_login);
         setPlans(plansData.plans);
         setBilling(billingData);
       } catch (e) {
@@ -109,12 +114,18 @@ export default function SettingsPanel() {
 
   async function handleConnectSalesDoctor() {
     try {
-      await connectSalesDoctor({ api_key: sdKey });
+      await connectSalesDoctor({
+        base_url: sdBaseUrl || 'https://api.salesdoctor.uz/v2',
+        login: sdLogin,
+        password: sdPassword,
+        filial_id: parseInt(sdFilialId) || 0,
+      });
       const me = await getMe();
       setTenant(me.tenant);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
-    } catch (e) {
+    } catch (e: any) {
+      window.alert(e?.message || 'Sales Doctor ulanishda xatolik');
       console.error(e);
     }
   }
@@ -216,14 +227,20 @@ export default function SettingsPanel() {
 
           <div>
             <label className="block text-sm font-medium text-slate-700 mb-1.5">Access Token</label>
+            {tenant?.moysklad_connected && !msToken && (
+              <div className="flex items-center gap-2 px-3 py-2.5 rounded-lg border border-emerald-200 bg-emerald-50 text-sm text-emerald-700 mb-2">
+                <CheckCircle2 className="w-4 h-4 shrink-0" />
+                Token saqlangan — yangilash uchun quyida yangi token kiriting
+              </div>
+            )}
             <div className="relative">
               <Key className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
               <input
                 type="password"
                 value={msToken}
                 onChange={(e) => setMsToken(e.target.value)}
-                placeholder="MoySklad API tokenini kiriting"
-                className="w-full pl-10 pr-4 py-2.5 rounded-lg border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                placeholder={tenant?.moysklad_connected ? '••••••••••••••••••••••••••••••••' : 'MoySklad API tokenini kiriting'}
+                className={`w-full pl-10 pr-4 py-2.5 rounded-lg border text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 ${tenant?.moysklad_connected ? 'border-emerald-200 bg-emerald-50/30' : 'border-slate-200'}`}
               />
             </div>
           </div>
@@ -255,15 +272,60 @@ export default function SettingsPanel() {
         </div>
 
         <div className="space-y-4">
+          {tenant?.salesdoctor_connected && (
+            <div className="flex items-center gap-2 px-3 py-2.5 rounded-lg border border-emerald-200 bg-emerald-50 text-sm text-emerald-700">
+              <CheckCircle2 className="w-4 h-4 shrink-0" />
+              Sales Doctor ulangan — yangilash uchun quyida qayta kiriting
+            </div>
+          )}
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1.5">API Key</label>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Server URL</label>
+            <div className="relative">
+              <Globe className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+              <input
+                type="text"
+                value={sdBaseUrl}
+                onChange={(e) => setSdBaseUrl(e.target.value)}
+                placeholder="https://api.salesdoctor.uz/v2"
+                className="w-full pl-10 pr-4 py-2.5 rounded-lg border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
+              />
+            </div>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Login</label>
             <div className="relative">
               <Key className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
               <input
+                type="text"
+                value={sdLogin}
+                onChange={(e) => setSdLogin(e.target.value)}
+                placeholder="Sales Doctor login (email yoki username)"
+                className="w-full pl-10 pr-4 py-2.5 rounded-lg border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
+              />
+            </div>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Parol</label>
+            <div className="relative">
+              <Shield className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+              <input
                 type="password"
-                value={sdKey}
-                onChange={(e) => setSdKey(e.target.value)}
-                placeholder="Sales Doctor API kalitini kiriting"
+                value={sdPassword}
+                onChange={(e) => setSdPassword(e.target.value)}
+                placeholder="Sales Doctor paroli"
+                className="w-full pl-10 pr-4 py-2.5 rounded-lg border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
+              />
+            </div>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">Filial ID <span className="text-slate-400 font-normal">(ixtiyoriy, standart: 0)</span></label>
+            <div className="relative">
+              <Database className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+              <input
+                type="number"
+                value={sdFilialId}
+                onChange={(e) => setSdFilialId(e.target.value)}
+                placeholder="0"
                 className="w-full pl-10 pr-4 py-2.5 rounded-lg border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
               />
             </div>
