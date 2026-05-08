@@ -1,0 +1,95 @@
+version: '3.8'
+
+# Dokploy deployment config
+# SSL va domain routing → Dokploy Traefik tomonidan boshqariladi
+# Bu faylni Dokploy "Compose" application sifatida yuklang
+
+services:
+  db:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: integration
+      POSTGRES_USER: integration_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U integration_user -d integration"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - integration_network
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - integration_network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: always
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://integration_user:${DB_PASSWORD}@db:5432/integration
+      - REDIS_URL=redis://redis:6379/0
+      - APP_SECRET_KEY=${APP_SECRET_KEY}
+      - DEBUG=false
+      - CORS_ORIGINS=${CORS_ORIGINS}
+      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL}
+      - MOYSKLAD_CLIENT_ID=${MOYSKLAD_CLIENT_ID}
+      - MOYSKLAD_CLIENT_SECRET=${MOYSKLAD_CLIENT_SECRET}
+      - MOYSKLAD_REDIRECT_URI=${MOYSKLAD_REDIRECT_URI}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "python -c 'import asyncio; from database import init_db; asyncio.run(init_db())' &&
+             uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2"
+    networks:
+      - integration_network
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    restart: always
+    depends_on:
+      - backend
+    networks:
+      - integration_network
+
+  # Nginx — HTTP only (Dokploy Traefik HTTPS ni boshqaradi)
+  nginx:
+    image: nginx:alpine
+    restart: always
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.dokploy.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - integration_network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  integration_network:
+    driver: bridge

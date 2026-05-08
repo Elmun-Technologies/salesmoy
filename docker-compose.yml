@@ -1,0 +1,116 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:15-alpine
+    container_name: integration_db
+    restart: always
+    environment:
+      POSTGRES_DB: integration
+      POSTGRES_USER: integration_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change_this_password_in_production}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    networks:
+      - integration_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U integration_user -d integration"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache & Queue
+  redis:
+    image: redis:7-alpine
+    container_name: integration_redis
+    restart: always
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    networks:
+      - integration_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: integration_backend
+    restart: always
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://integration_user:${DB_PASSWORD:-change_this_password_in_production}@db:5432/integration
+      - REDIS_URL=redis://redis:6379/0
+      - APP_SECRET_KEY=${APP_SECRET_KEY:-change-me-in-production-min-32-chars}
+      - DEBUG=false
+      - CORS_ORIGINS=${CORS_ORIGINS:-https://your-domain.com}
+      - MOYSKLAD_CLIENT_ID=${MOYSKLAD_CLIENT_ID:-}
+      - MOYSKLAD_CLIENT_SECRET=${MOYSKLAD_CLIENT_SECRET:-}
+      - MOYSKLAD_REDIRECT_URI=${MOYSKLAD_REDIRECT_URI:-}
+      - PAYME_MERCHANT_ID=${PAYME_MERCHANT_ID:-}
+      - PAYME_SECRET_KEY=${PAYME_SECRET_KEY:-}
+      - CLICK_SERVICE_ID=${CLICK_SERVICE_ID:-}
+      - CLICK_SECRET_KEY=${CLICK_SECRET_KEY:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks:
+      - integration_network
+    command: >
+      sh -c "python -c 'import asyncio; from database import init_db; asyncio.run(init_db())' &&
+             python seed.py &&
+             uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4"
+
+  # Frontend (Static files)
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: integration_frontend
+    restart: always
+    depends_on:
+      - backend
+    networks:
+      - integration_network
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: integration_nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+      - ./frontend/dist:/usr/share/nginx/html:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - integration_network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  integration_network:
+    driver: bridge

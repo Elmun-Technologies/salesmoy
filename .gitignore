@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Environment
+.env
+backend/.env
+!.env.dokploy
+!backend/.env.example
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Node
+node_modules/
+dist/
+.cache/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# SSL
+ssl/
+*.pem
+*.key
+*.crt
