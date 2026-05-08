@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     # App
     app_secret_key: str = "change-me-in-production"
     debug: bool = True
+    test_mode: bool = False
     cors_origins: str = "http://localhost:5173,http://localhost:3000"
 
     # Sync intervals (seconds)

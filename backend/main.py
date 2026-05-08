@@ -156,8 +156,7 @@ async def lifespan(app: FastAPI):
     logger.info("🗄️  Database initialized")
 
     # Background sync — TEST_MODE=true bo'lsa o'chiriladi (xavfsiz test uchun)
-    import os
-    test_mode = os.getenv("TEST_MODE", "false").lower() == "true"
+    test_mode = settings.test_mode
 
     if test_mode:
         tasks = []

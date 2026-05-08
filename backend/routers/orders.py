@@ -96,6 +96,22 @@ async def get_order(order_id: str, request: Request, db: AsyncSession = Depends(
     }
 
 
+@router.post("/sync/pull")
+async def pull_orders_from_moysklad(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Pull new orders from MoySklad → Sales Doctor."""
+    tenant_id = get_tenant_id(request)
+    result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
+    tenant = result.scalar_one()
+
+    service = SyncService(db, tenant)
+    await service.init_clients()
+    await service.sync_orders_from_moysklad()
+    return {"success": True, "message": "Order pull sync triggered"}
+
+
 @router.post("/sync")
 async def sync_order_to_moysklad(
     order_data: dict,

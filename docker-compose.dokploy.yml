@@ -46,6 +46,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - APP_SECRET_KEY=${APP_SECRET_KEY}
       - DEBUG=false
+      - TEST_MODE=false
       - CORS_ORIGINS=${CORS_ORIGINS}
       - FRONTEND_BASE_URL=${FRONTEND_BASE_URL}
       - MOYSKLAD_CLIENT_ID=${MOYSKLAD_CLIENT_ID}

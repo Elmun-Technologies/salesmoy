@@ -6,7 +6,7 @@ function getApiBase(): string {
   if (fromStorage) return fromStorage;
   const fromEnv = (import.meta as any).env?.VITE_API_URL;
   if (fromEnv) return fromEnv;
-  return 'http://localhost:8000';
+  return import.meta.env.PROD ? '' : 'http://localhost:8000';
 }
 
 let API_BASE = getApiBase();
