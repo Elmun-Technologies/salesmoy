@@ -101,7 +101,7 @@ async def pull_orders_from_moysklad(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Pull new orders from MoySklad → Sales Doctor."""
+    """Pull new orders bidirectionally: MoySklad ↔ Sales Doctor."""
     tenant_id = get_tenant_id(request)
     result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
     tenant = result.scalar_one()
@@ -109,7 +109,8 @@ async def pull_orders_from_moysklad(
     service = SyncService(db, tenant)
     await service.init_clients()
     await service.sync_orders_from_moysklad()
-    return {"success": True, "message": "Order pull sync triggered"}
+    await service.sync_orders_from_salesdoctor()
+    return {"success": True, "message": "Order sync (bidirectional) triggered"}
 
 
 @router.post("/sync")

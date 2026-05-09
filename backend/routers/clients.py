@@ -108,4 +108,5 @@ async def sync_clients_now(request: Request, db: AsyncSession = Depends(get_db))
     service = SyncService(db, tenant)
     await service.init_clients()
     await service.sync_clients_from_moysklad()
-    return {"success": True, "message": "Client sync triggered"}
+    await service.sync_clients_from_salesdoctor()
+    return {"success": True, "message": "Client sync (bidirectional) triggered"}

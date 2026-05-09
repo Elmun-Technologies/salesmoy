@@ -11,6 +11,8 @@ import {
   Zap,
   Crown,
   Building2,
+  Webhook,
+  AlertTriangle,
 } from 'lucide-react';
 import {
   getMe,
@@ -19,6 +21,9 @@ import {
   connectMoySklad,
   connectSalesDoctor,
   startMoySkladOAuth,
+  getMoySkladWebhookStatus,
+  registerMoySkladWebhooks,
+  unregisterMoySkladWebhooks,
 } from '../services/api';
 
 const DEFAULT_PLANS: Record<string, any> = {
@@ -110,6 +115,45 @@ export default function SettingsPanel() {
   const [sdPassword, setSdPassword] = useState('');
   const [sdFilialId, setSdFilialId] = useState('0');
 
+  // MoySklad webhooks
+  const [whStatus, setWhStatus] = useState<any>(null);
+  const [whBusy, setWhBusy] = useState(false);
+
+  async function refreshWebhookStatus() {
+    try {
+      const s = await getMoySkladWebhookStatus();
+      setWhStatus(s);
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  async function handleRegisterWebhooks() {
+    setWhBusy(true);
+    try {
+      const r = await registerMoySkladWebhooks();
+      if (!r.success) {
+        window.alert(r.error || 'Webhook ulanmadi');
+      }
+      await refreshWebhookStatus();
+    } catch (e: any) {
+      window.alert(e?.message || 'Webhook ulanishda xatolik');
+    } finally {
+      setWhBusy(false);
+    }
+  }
+
+  async function handleUnregisterWebhooks() {
+    if (!window.confirm('MoySklad webhooklarini o\'chirish? Real-time sinxron 5-daq pollingga qaytadi.')) return;
+    setWhBusy(true);
+    try {
+      await unregisterMoySkladWebhooks();
+      await refreshWebhookStatus();
+    } finally {
+      setWhBusy(false);
+    }
+  }
+
   useEffect(() => {
     async function load() {
       try {
@@ -123,6 +167,10 @@ export default function SettingsPanel() {
         if (me.tenant?.salesdoctor_login) setSdLogin(me.tenant.salesdoctor_login);
         setPlans(plansData.plans);
         setBilling(billingData);
+        // Webhook status — only meaningful if MS connected
+        if (me.tenant?.moysklad_connected) {
+          await refreshWebhookStatus();
+        }
       } catch (e) {
         console.error(e);
       } finally {
@@ -285,6 +333,79 @@ export default function SettingsPanel() {
           </button>
         </div>
       </motion.div>
+
+      {/* MoySklad Webhooks (real-time sync) */}
+      {tenant?.moysklad_connected && (
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.15 }}
+          className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm"
+        >
+          <div className="flex items-center gap-3 mb-5">
+            <div className="w-10 h-10 rounded-lg bg-violet-100 flex items-center justify-center">
+              <Webhook className="w-5 h-5 text-violet-600" />
+            </div>
+            <div>
+              <h3 className="font-semibold text-slate-900">Real-time webhook</h3>
+              <p className="text-xs text-slate-500">MoySklad'da har bir o'zgarish bir necha sekundda SD'ga uzatiladi</p>
+            </div>
+          </div>
+
+          {whStatus?.connected ? (
+            <div className="flex items-center gap-2 px-3 py-2.5 rounded-lg border border-emerald-200 bg-emerald-50 text-sm text-emerald-700 mb-3">
+              <CheckCircle2 className="w-4 h-4 shrink-0" />
+              Webhook ulangan ({whStatus.registered_count} ta hodisa) — real-time rejim faol
+            </div>
+          ) : whStatus?.public_base_url ? (
+            <div className="flex items-center gap-2 px-3 py-2.5 rounded-lg border border-amber-200 bg-amber-50 text-sm text-amber-700 mb-3">
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+              Webhook ulanmagan — hozirgi cadence: ≤5 daq polling
+            </div>
+          ) : (
+            <div className="flex items-start gap-2 px-3 py-2.5 rounded-lg border border-red-200 bg-red-50 text-sm text-red-700 mb-3">
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+              <div>
+                <div>Server <code className="bg-red-100 px-1 rounded">PUBLIC_BASE_URL</code> sozlanmagan.</div>
+                <div className="text-xs mt-1">Admin: server <code className="bg-red-100 px-1 rounded">.env</code> faylida HTTPS bazaviy URL'ni qo'shing.</div>
+              </div>
+            </div>
+          )}
+
+          {whStatus?.target_url && (
+            <p className="text-xs text-slate-500 mb-3 break-all">
+              Webhook URL: <code className="bg-slate-100 px-1 rounded">{whStatus.target_url}</code>
+            </p>
+          )}
+
+          <div className="flex gap-2">
+            <button
+              onClick={handleRegisterWebhooks}
+              disabled={whBusy || !whStatus?.public_base_url}
+              className="flex items-center gap-2 px-4 py-2 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium transition-colors"
+            >
+              {whBusy ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Webhook className="w-4 h-4" />}
+              {whStatus?.connected ? 'Qayta ro\'yxatdan o\'tkazish' : 'Real-time webhook ulash'}
+            </button>
+            {whStatus?.connected && (
+              <button
+                onClick={handleUnregisterWebhooks}
+                disabled={whBusy}
+                className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 rounded-lg text-sm font-medium transition-colors"
+              >
+                O'chirish
+              </button>
+            )}
+            <button
+              onClick={refreshWebhookStatus}
+              disabled={whBusy}
+              className="flex items-center gap-2 px-3 py-2 bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 rounded-lg text-sm font-medium transition-colors"
+            >
+              <RefreshCw className={`w-4 h-4 ${whBusy ? 'animate-spin' : ''}`} />
+            </button>
+          </div>
+        </motion.div>
+      )}
 
       {/* Sales Doctor Connection */}
       <motion.div

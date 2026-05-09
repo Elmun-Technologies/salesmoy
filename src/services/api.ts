@@ -148,6 +148,25 @@ export const connectSalesDoctor = (data: unknown) =>
     () => Promise.resolve({ success: true })
   );
 
+// MoySklad webhooks (real-time sync)
+export const getMoySkladWebhookStatus = () =>
+  withFallback(
+    () => fetchJson('/api/integrations/moysklad/webhook/status'),
+    () => Promise.resolve({ connected: false, public_base_url: '', registered_count: 0, registered: [] })
+  );
+
+export const registerMoySkladWebhooks = () =>
+  withFallback(
+    () => fetchJson('/api/integrations/moysklad/webhook/register', { method: 'POST' }),
+    () => Promise.resolve({ success: false, error: 'mock' })
+  );
+
+export const unregisterMoySkladWebhooks = () =>
+  withFallback(
+    () => fetchJson('/api/integrations/moysklad/webhook/unregister', { method: 'DELETE' }),
+    () => Promise.resolve({ success: true })
+  );
+
 // Billing
 export const getPlans = () =>
   withFallback(() => fetchJson('/api/billing/plans'), () => mock.mockGetPlans());

@@ -24,6 +24,15 @@ class SyncService:
     _last_product_sync: Dict[int, datetime] = {}
     PRODUCT_SYNC_INTERVAL_SECONDS = 86400  # sync products to SD once per day max
 
+    # Cached SD client categories per tenant {tenant_id: {"retail": SD_id, "wholesale": SD_id}}
+    _sd_client_categories: Dict[int, Dict[str, str]] = {}
+
+    # Cached SD default agent per tenant {tenant_id: {"code_1C": ..., "SD_id": ...}}
+    _sd_default_agent: Dict[int, Dict[str, str]] = {}
+
+    # Cached SD order defaults (priceType, warehouse) per tenant
+    _sd_order_defaults: Dict[int, Dict[str, Dict[str, str]]] = {}
+
     def __init__(self, db: AsyncSession, tenant: Tenant):
         self.db = db
         self.tenant = tenant
@@ -34,6 +43,15 @@ class SyncService:
         """Initialize API clients with tenant credentials."""
         if self.tenant.moysklad_access_token:
             self.ms = MoySkladClient(token=self.tenant.moysklad_access_token)
+            # Auto-discover and persist accountId for webhook routing
+            if not self.tenant.moysklad_account_id:
+                try:
+                    account_id = await self.ms.get_account_id()
+                    if account_id:
+                        self.tenant.moysklad_account_id = account_id
+                        await self.db.commit()
+                except Exception as e:
+                    logger.warning("Could not fetch MS accountId for tenant %s: %s", self.tenant.id, e)
 
         if self.tenant.salesdoctor_token and self.tenant.salesdoctor_user_id:
             self.sd = SalesDoctorClient(
@@ -115,23 +133,17 @@ class SyncService:
 
             await self.db.commit()
 
-            # Sync client to Sales Doctor (exact SD API field names)
+            # Sync client to Sales Doctor
             if self.sd:
                 try:
-                    sd_client = {
-                        "CS_id": "",
-                        "SD_id": "",
-                        "code_1C": phone or ms_client.get("id", ""),
-                        "shortName": name,
-                        "firmName": name,
-                        "address": client_data.get("address", ""),
-                        "orentir": "",
-                        "tel": phone,
-                        "comment": "",
-                        "lat": str(client_data.get("lat", "")),
-                        "lon": str(client_data.get("lon", "")),
-                        "active": "Y",
-                    }
+                    ct = "wholesale" if client_data.get("type") == "Опт" else "retail"
+                    category = await self._get_sd_category_id(ct)
+                    sd_client = self._build_sd_client(
+                        name=name, phone=phone,
+                        address=client_data.get("address", ""),
+                        client_type=ct, category=category,
+                        location=client_data.get("location", ""),
+                    )
                     await self.sd.set_client([sd_client])
                 except Exception as e:
                     logger.warning("SalesDoctor setClient failed: %s", e)
@@ -176,7 +188,7 @@ class SyncService:
                             Client.is_duplicate == False,
                         )
                     )
-                    by_phone = r.scalar_one_or_none()
+                    by_phone = r.scalars().first()
 
                 r = await self.db.execute(
                     select(Client).where(
@@ -185,7 +197,7 @@ class SyncService:
                         Client.is_duplicate == False,
                     )
                 )
-                by_name = r.scalar_one_or_none()
+                by_name = r.scalars().first()
 
                 # Both found and they differ → merge name-match into phone-match
                 if by_phone and by_name and by_phone.id != by_name.id:
@@ -220,6 +232,38 @@ class SyncService:
                 synced += 1
 
             await self.db.commit()
+
+            # Push all synced clients to Sales Doctor in batches
+            if self.sd and counterparties:
+                try:
+                    category = await self._get_sd_category_id("retail")
+                    sd_clients_batch = []
+                    for cp in counterparties:
+                        cp_name = cp.get("name", "").strip()
+                        cp_phone = cp.get("phone", "").strip()
+                        if not cp_name:
+                            continue
+                        sd_clients_batch.append(self._build_sd_client(
+                            name=cp_name,
+                            phone=cp_phone,
+                            address=cp.get("actualAddress", ""),
+                            client_type="retail",
+                            category=category,
+                        ))
+                    batch_size = 100
+                    failed = 0
+                    for i in range(0, len(sd_clients_batch), batch_size):
+                        try:
+                            await self.sd.set_client(sd_clients_batch[i:i + batch_size])
+                        except Exception as e:
+                            failed += 1
+                            logger.warning("SalesDoctor setClient batch %d failed: %s", i // batch_size, e)
+                    if failed:
+                        await self.log(LogType.ERROR, "Client Sync",
+                                       f"{failed} setClient batch(es) failed of {(len(sd_clients_batch)+batch_size-1)//batch_size}")
+                except Exception as e:
+                    await self.log(LogType.ERROR, "Client Sync", f"SalesDoctor push failed: {e}")
+
             msg = f"Synced {synced} clients"
             if merged:
                 msg += f", merged {merged} duplicates"
@@ -227,6 +271,103 @@ class SyncService:
 
         except Exception as e:
             await self.log(LogType.ERROR, "Client Sync", f"Failed: {e}")
+
+    async def sync_clients_from_salesdoctor(self):
+        """Pull SD clients that don't have code_1C and push them to MoySklad.
+
+        SD-originated clients have code_1C=null; MS-originated clients have code_1C set.
+        For each SD-only client we create a MoySklad counterparty and update SD with code_1C.
+        """
+        if not self.sd or not self.ms:
+            return
+
+        try:
+            sd_clients = await self.sd.get_clients()
+            new_in_ms = 0
+            sd_updates: List[Dict] = []
+
+            for c in sd_clients:
+                if c.get("code_1C"):
+                    continue  # already linked to MS
+
+                phone = (c.get("tel") or "").strip()
+                name = (c.get("shortName") or c.get("firmName") or "").strip()
+                if not name and not phone:
+                    continue
+
+                # Idempotency: skip if local Client already has this SD_id
+                sd_id = c.get("SD_id", "")
+                r = await self.db.execute(
+                    select(Client).where(
+                        Client.tenant_id == self.tenant.id,
+                        Client.salesdoctor_id == sd_id,
+                    )
+                )
+                if r.scalars().first():
+                    continue
+
+                # Find or create MS counterparty by phone
+                ms_client = None
+                if phone:
+                    existing = await self.ms.get_counterparties(phone=phone)
+                    if existing:
+                        ms_client = existing[0]
+                if not ms_client:
+                    try:
+                        ms_client = await self.ms.create_counterparty(
+                            name=name or phone,
+                            phone=phone,
+                            actualAddress=c.get("address", ""),
+                        )
+                    except Exception as e:
+                        logger.warning("MS create_counterparty failed for %s: %s", name, e)
+                        continue
+
+                ms_id = ms_client.get("id", "")
+                code_1c = phone or ms_id
+
+                # Save in local DB
+                local = Client(
+                    tenant_id=self.tenant.id,
+                    moysklad_id=ms_id,
+                    salesdoctor_id=sd_id,
+                    name=name or phone,
+                    phone=phone,
+                    address=c.get("address", ""),
+                    client_type=ClientType.RETAIL,
+                )
+                self.db.add(local)
+
+                # Push code_1C back to SD so future syncs skip it
+                category = await self._get_sd_category_id("retail")
+                sd_updates.append({
+                    "CS_id": c.get("CS_id", ""),
+                    "SD_id": sd_id,
+                    "code_1C": code_1c,
+                    "shortName": name or phone,
+                    "firmName": name or phone,
+                    "tel": phone,
+                    "address": c.get("address", ""),
+                    "active": "Y",
+                    "clientCategory": category if category else None,
+                })
+                new_in_ms += 1
+
+            await self.db.commit()
+
+            # Push SD updates in batches of 100
+            batch_size = 100
+            for i in range(0, len(sd_updates), batch_size):
+                try:
+                    await self.sd.set_client(sd_updates[i:i + batch_size])
+                except Exception as e:
+                    logger.warning("SD set_client (write-back) batch %d failed: %s", i // batch_size, e)
+
+            if new_in_ms:
+                await self.log(LogType.SUCCESS, "Client Sync",
+                               f"Synced {new_in_ms} new clients SD → MoySklad")
+        except Exception as e:
+            await self.log(LogType.ERROR, "Client Sync", f"sync_clients_from_salesdoctor failed: {e}")
 
     # ========== Order Sync ==========
 
@@ -292,16 +433,31 @@ class SyncService:
             comment=description,
             total_amount=total,
             status=status_map.get(state_name, OrderStatus.NEW),
-            sync_status=SyncStatus.SYNCED,
+            sync_status=SyncStatus.PENDING,
             items=items,
             raw_data={"source": "moysklad", "state": state_name},
-            synced_at=datetime.utcnow(),
         )
         self.db.add(order)
 
         # Push to Sales Doctor via setOrder (using exact SD API field names)
         if self.sd:
             try:
+                # Ensure client exists in SD before pushing order
+                client_code = client_phone or client_name
+                if client_code:
+                    try:
+                        category = await self._get_sd_category_id("retail")
+                        sd_client = self._build_sd_client(
+                            name=client_name or client_code,
+                            phone=client_phone,
+                            address="",
+                            client_type="retail",
+                            category=category,
+                        )
+                        await self.sd.set_client([sd_client])
+                    except Exception as e:
+                        logger.warning("Pre-order setClient failed for %s: %s", client_code, e)
+
                 order_products = [
                     {
                         "product": {"code_1C": item.get("sku", "")},
@@ -318,14 +474,25 @@ class SyncService:
                     "code_1C": order_name,
                     "comment": description,
                     "status": MS_STATUS_TO_SD.get(state_name, 1),
-                    "client": {"code_1C": client_phone or client_name},
+                    "client": {"code_1C": client_code},
                     "orderProducts": order_products,
                 }
-                resp = await self.sd.set_order([sd_order])
-                # SD may return assigned IDs in the response; store code_1C as salesdoctor_id for now
+                agent_ref = await self._get_sd_default_agent()
+                if agent_ref:
+                    sd_order["agent"] = agent_ref
+                order_defaults = await self._get_sd_order_defaults()
+                if order_defaults.get("priceType"):
+                    sd_order["priceType"] = order_defaults["priceType"]
+                if order_defaults.get("warehouse"):
+                    sd_order["warehouse"] = order_defaults["warehouse"]
+                await self.sd.set_order([sd_order])
                 order.salesdoctor_id = order_name
+                order.sync_status = SyncStatus.SYNCED
+                order.synced_at = datetime.utcnow()
             except Exception as e:
-                logger.warning("Could not push order %s to Sales Doctor: %s", order_name, e)
+                order.sync_status = SyncStatus.FAILED
+                await self.log(LogType.ERROR, "Order Sync",
+                               f"setOrder failed for {order_name}: {e}")
 
         await self.db.commit()
         await self.log(LogType.SUCCESS, "Order Sync", f"MoySklad order {order_name} → Sales Doctor", order.id)
@@ -336,6 +503,7 @@ class SyncService:
 
         Only fetches orders from the last 24 hours. Historical orders are not
         imported automatically — they can be synced on demand if the client requests.
+        Also retries SD push for any DB orders that don't have salesdoctor_id yet.
         """
         if not self.ms:
             return
@@ -350,17 +518,19 @@ class SyncService:
                 if not ms_id:
                     continue
 
-                # Skip if already in DB
+                # Check if already in DB
                 result = await self.db.execute(
                     select(Order).where(
                         Order.tenant_id == self.tenant.id,
                         Order.moysklad_id == ms_id,
                     )
                 )
-                if result.scalar_one_or_none():
+                existing = result.scalar_one_or_none()
+
+                if existing:
                     continue
 
-                # Fetch full order with positions expanded (single-order endpoint supports this)
+                # New order: full processing
                 try:
                     ms_order_full = await self.ms.get_customer_order_with_positions(ms_id)
                     order = await self.process_moysklad_order(ms_order_full)
@@ -371,10 +541,223 @@ class SyncService:
                     continue
 
             if synced > 0:
-                await self.log(LogType.SUCCESS, "Order Sync", f"Synced {synced} new orders from MoySklad")
+                await self.log(LogType.SUCCESS, "Order Sync",
+                               f"Synced {synced} new orders from MoySklad")
 
         except Exception as e:
             await self.log(LogType.ERROR, "Order Sync", f"sync_orders_from_moysklad failed: {e}")
+
+    async def sync_orders_from_salesdoctor(self):
+        """Pull SD orders that originated in SD (no code_1C) and create them in MoySklad.
+
+        Orders pushed from MS have code_1C set; SD-only orders have code_1C=null.
+        For each SD-only order, create a MoySklad customerorder and write code_1C back.
+        """
+        if not self.sd or not self.ms:
+            return
+
+        try:
+            sd_orders = await self.sd.get_orders()
+            new_in_ms = 0
+            sd_updates: List[Dict] = []
+
+            org = await self.ms.get_organization()
+            store = await self.ms.get_store()
+            if not org or not store:
+                return
+
+            for o in sd_orders:
+                if o.get("code_1C"):
+                    continue  # already linked to MS
+
+                sd_id = o.get("SD_id", "")
+                if not sd_id:
+                    continue
+
+                # Skip if already imported
+                r = await self.db.execute(
+                    select(Order).where(
+                        Order.tenant_id == self.tenant.id,
+                        Order.salesdoctor_id == sd_id,
+                    )
+                )
+                if r.scalars().first():
+                    continue
+
+                client_block = o.get("client") or {}
+                client_phone = (client_block.get("tel") or "").strip()
+                client_name = (client_block.get("shortName") or client_block.get("firmName") or "").strip()
+                client_code_1c = client_block.get("code_1C") or client_phone
+
+                # Find or create MS counterparty
+                counterparty = None
+                if client_phone:
+                    existing = await self.ms.get_counterparties(phone=client_phone)
+                    if existing:
+                        counterparty = existing[0]
+                if not counterparty and (client_name or client_phone):
+                    try:
+                        counterparty = await self.ms.create_counterparty(
+                            name=client_name or client_phone,
+                            phone=client_phone,
+                        )
+                    except Exception as e:
+                        logger.warning("MS create_counterparty failed: %s", e)
+                        continue
+                if not counterparty:
+                    continue
+
+                # Build positions from SD orderProducts
+                positions = []
+                products_invalid = False
+                for p in o.get("orderProducts", []) or []:
+                    sku = (p.get("product") or {}).get("code_1C") or p.get("code_1C")
+                    qty = p.get("quantity", 1)
+                    price = p.get("price", 0)
+                    if not sku:
+                        continue
+                    ms_product = await self.ms.get_product_by_code(sku)
+                    if not ms_product:
+                        products_invalid = True
+                        logger.warning("MS product not found for SKU %s — skip order %s", sku, sd_id)
+                        break
+                    positions.append({
+                        "quantity": qty,
+                        "price": price,
+                        "assortment": {"meta": ms_product.get("meta")},
+                    })
+                if products_invalid or not positions:
+                    continue
+
+                order_name = f"SD-{sd_id}"
+                ms_order_data = {
+                    "name": order_name,
+                    "organization": {"meta": org["meta"]},
+                    "agent": {"meta": counterparty["meta"]},
+                    "store": {"meta": store["meta"]},
+                    "positions": positions,
+                    "description": o.get("comment", ""),
+                }
+
+                try:
+                    ms_order = await self.ms.create_customer_order(ms_order_data)
+                except Exception as e:
+                    logger.warning("MS create_customer_order failed for SD %s: %s", sd_id, e)
+                    continue
+
+                ms_id = ms_order.get("id", "")
+
+                local = Order(
+                    tenant_id=self.tenant.id,
+                    order_id=order_name,
+                    moysklad_id=ms_id,
+                    salesdoctor_id=sd_id,
+                    client_name=client_name,
+                    client_phone=client_phone,
+                    agent_name="SalesDoctor",
+                    comment=o.get("comment", ""),
+                    total_amount=o.get("totalSumma", 0) or 0,
+                    status=OrderStatus.NEW,
+                    sync_status=SyncStatus.SYNCED,
+                    items=[
+                        {"sku": (p.get("product") or {}).get("code_1C", ""),
+                         "qty": p.get("quantity", 1),
+                         "price": p.get("price", 0)}
+                        for p in (o.get("orderProducts") or [])
+                    ],
+                    raw_data={"source": "salesdoctor", "ms_order_name": order_name},
+                    synced_at=datetime.utcnow(),
+                )
+                self.db.add(local)
+                new_in_ms += 1
+
+                # Write code_1C back to SD so we don't reprocess
+                sd_updates.append({
+                    "CS_id": o.get("CS_id", ""),
+                    "SD_id": sd_id,
+                    "code_1C": order_name,
+                })
+
+            await self.db.commit()
+
+            # Update SD orders with code_1C in batches
+            for i in range(0, len(sd_updates), 100):
+                try:
+                    await self.sd._rpc("setOrder", {"order": sd_updates[i:i + 100]})
+                except Exception as e:
+                    logger.warning("SD setOrder write-back batch %d failed: %s", i // 100, e)
+
+            if new_in_ms:
+                await self.log(LogType.SUCCESS, "Order Sync",
+                               f"Synced {new_in_ms} new orders SD → MoySklad")
+        except Exception as e:
+            await self.log(LogType.ERROR, "Order Sync", f"sync_orders_from_salesdoctor failed: {e}")
+
+    async def _push_order_to_sd(self, order: Order, ms_order: Dict):
+        """Push an existing DB order to Sales Doctor (used for retries)."""
+        if not self.sd:
+            return
+
+        agent_data = ms_order.get("agent", {})
+        client_name = agent_data.get("name", order.client_name or "")
+        client_phone = (agent_data.get("phone") or agent_data.get("actualPhone") or order.client_phone or "")
+        state_name = ms_order.get("state", {}).get("name", "Новый") if isinstance(ms_order.get("state"), dict) else "Новый"
+        description = ms_order.get("description", order.comment or "")
+
+        items: List[Dict] = []
+        positions_block = ms_order.get("positions", {})
+        if isinstance(positions_block, dict):
+            for pos in positions_block.get("rows", []):
+                assortment = pos.get("assortment", {})
+                items.append({
+                    "sku": assortment.get("code", ""),
+                    "qty": pos.get("quantity", 1),
+                    "price": pos.get("price", 0),
+                })
+
+        client_code = client_phone or client_name
+        if client_code:
+            try:
+                category = await self._get_sd_category_id("retail")
+                sd_client = self._build_sd_client(
+                    name=client_name or client_code,
+                    phone=client_phone,
+                    address="",
+                    client_type="retail",
+                    category=category,
+                )
+                await self.sd.set_client([sd_client])
+            except Exception as e:
+                logger.warning("Pre-order setClient failed for %s: %s", client_code, e)
+
+        order_products = [
+            {
+                "product": {"code_1C": item.get("sku", "")},
+                "quantity": item.get("qty", 1),
+                "price": item.get("price", 0),
+                "discountSumma": 0,
+            }
+            for item in items if item.get("sku")
+        ]
+        sd_order = {
+            "CS_id": "", "SD_id": "",
+            "code_1C": order.order_id,
+            "comment": description,
+            "status": MS_STATUS_TO_SD.get(state_name, 1),
+            "client": {"code_1C": client_code},
+            "orderProducts": order_products,
+        }
+        agent_ref = await self._get_sd_default_agent()
+        if agent_ref:
+            sd_order["agent"] = agent_ref
+        order_defaults = await self._get_sd_order_defaults()
+        if order_defaults.get("priceType"):
+            sd_order["priceType"] = order_defaults["priceType"]
+        if order_defaults.get("warehouse"):
+            sd_order["warehouse"] = order_defaults["warehouse"]
+        await self.sd.set_order([sd_order])
+        order.salesdoctor_id = order.order_id
+        await self.db.commit()
 
     async def create_order_in_moysklad(self, order_data: Dict) -> Optional[Dict]:
         """Create order in MoySklad from Sales Doctor data."""
@@ -521,7 +904,14 @@ class SyncService:
                 "Отменен": OrderStatus.CANCELLED,
             }
 
-            order.status = status_map.get(new_status, order.status)
+            new_local_status = status_map.get(new_status, order.status)
+
+            # Short-circuit: if local status already matches, the change came from us — skip SD push to break echo loops
+            if order.status == new_local_status:
+                await self.log(LogType.INFO, "Order Sync", f"Status {new_status} already current — no-op", order.id)
+                return
+
+            order.status = new_local_status
             order.sync_status = SyncStatus.SYNCED
             order.updated_at = datetime.utcnow()
             await self.db.commit()
@@ -621,6 +1011,171 @@ class SyncService:
         except Exception as e:
             logger.warning("sync_products_to_salesdoctor failed: %s", e)
 
+    async def _get_sd_category_id(self, client_type: str = "retail") -> Dict:
+        """Return SD clientCategory reference for retail or wholesale.
+
+        Fetches categories once per session and caches. Falls back to first available.
+        """
+        if not self.sd:
+            return {}
+        cached = SyncService._sd_client_categories.get(self.tenant.id)
+        if not cached:
+            try:
+                result = await self.sd._rpc("getClientCategory", {})
+                cats = result.get("clientCategory", []) if isinstance(result, dict) else []
+                cached = {}
+                for c in cats:
+                    name_lower = (c.get("name") or "").lower()
+                    if "розница" in name_lower or "retail" in name_lower:
+                        cached["retail"] = {"SD_id": c["SD_id"]}
+                    elif "опт" in name_lower or "wholesale" in name_lower:
+                        cached["wholesale"] = {"SD_id": c["SD_id"]}
+                # fallback: use first category for both if mapping not found
+                if cats and "retail" not in cached:
+                    cached["retail"] = {"SD_id": cats[0]["SD_id"]}
+                if cats and "wholesale" not in cached:
+                    cached["wholesale"] = cached.get("retail", {"SD_id": cats[0]["SD_id"]})
+                SyncService._sd_client_categories[self.tenant.id] = cached
+            except Exception as e:
+                logger.warning("SD getClientCategory failed: %s", e)
+                return {}
+        return cached.get(client_type, cached.get("retail", {}))
+
+    async def _get_sd_order_defaults(self) -> Dict[str, Dict[str, str]]:
+        """Ensure SD has priceType, paymentType, valyutaType, warehouse set up
+        and return references {"priceType": {...}, "warehouse": {...}} for setOrder.
+
+        Lazy: runs once per tenant. SD requires every order to reference these.
+        """
+        if not self.sd:
+            return {}
+        cached = SyncService._sd_order_defaults.get(self.tenant.id)
+        if cached:
+            return cached
+
+        defaults: Dict[str, Dict[str, str]] = {}
+        try:
+            # 1) Ensure paymentType has code_1C "cash"
+            pt_result = await self.sd._rpc("getPaymentType", {})
+            payment_types = pt_result.get("currency", []) if isinstance(pt_result, dict) else []
+            cash_pt = next((p for p in payment_types if p.get("code_1C") == "cash"), None)
+            if not cash_pt and payment_types:
+                # Pick first UZS payment type and assign code_1C "cash"
+                first_uzs = next((p for p in payment_types if p.get("short") == "UZS"), payment_types[0])
+                await self.sd._rpc("setPaymentType", {"paymentType": [{
+                    "CS_id": first_uzs.get("CS_id", ""),
+                    "SD_id": first_uzs.get("SD_id", ""),
+                    "code_1C": "cash",
+                    "name": first_uzs.get("name", "Наличные"),
+                    "short": first_uzs.get("short", "UZS"),
+                    "active": "Y",
+                }]})
+                cash_pt = first_uzs
+
+            # 2) Get valyutaType (currency)
+            vt_result = await self.sd._rpc("getValyutaType", {})
+            valyuta_types = vt_result.get("valyutaType", []) if isinstance(vt_result, dict) else []
+            uzs_vt = next((v for v in valyuta_types if v.get("short") == "UZS"), valyuta_types[0] if valyuta_types else None)
+
+            # 3) Ensure priceType has code_1C "retail"
+            ptype_result = await self.sd._rpc("getPriceType", {})
+            price_types = ptype_result.get("priceType", []) if isinstance(ptype_result, dict) else []
+            retail_pt = next((p for p in price_types if p.get("code_1C") == "retail"), None)
+            if not retail_pt and uzs_vt and cash_pt:
+                await self.sd._rpc("setPriceType", {"priceType": [{
+                    "CS_id": "", "SD_id": "",
+                    "code_1C": "retail",
+                    "name": "Розничная",
+                    "paymentType": {"SD_id": cash_pt.get("SD_id", "")},
+                    "valyutaType": {"SD_id": uzs_vt.get("SD_id", "")},
+                    "active": "Y",
+                }]})
+            defaults["priceType"] = {"code_1C": "retail"}
+
+            # 4) Ensure warehouse has code_1C set
+            wh_result = await self.sd._rpc("getWarehouse", {})
+            warehouses = wh_result.get("warehouse", []) if isinstance(wh_result, dict) else []
+            wh_with_code = next((w for w in warehouses if w.get("code_1C")), None)
+            if wh_with_code:
+                defaults["warehouse"] = {"code_1C": wh_with_code["code_1C"]}
+            elif warehouses:
+                # Assign code_1C "main" to first warehouse
+                first_wh = warehouses[0]
+                await self.sd._rpc("setWarehouse", {"warehouse": [{
+                    "CS_id": first_wh.get("CS_id", ""),
+                    "SD_id": first_wh.get("SD_id", ""),
+                    "code_1C": "main",
+                    "name": first_wh.get("name", "Основной склад"),
+                    "active": "Y",
+                }]})
+                defaults["warehouse"] = {"code_1C": "main"}
+
+            SyncService._sd_order_defaults[self.tenant.id] = defaults
+        except Exception as e:
+            logger.warning("SD order defaults setup failed: %s", e)
+        return defaults
+
+    async def _get_sd_default_agent(self) -> Optional[Dict]:
+        """Return SD default agent reference {"code_1C": ...} for setOrder.
+
+        SD requires every order to have an agent. Caches first available agent per tenant.
+        """
+        if not self.sd:
+            return None
+        cached = SyncService._sd_default_agent.get(self.tenant.id)
+        if cached:
+            return cached
+        try:
+            result = await self.sd._rpc("getAgent", {})
+            agents = result.get("agent", []) if isinstance(result, dict) else []
+            if not agents:
+                return None
+            # Prefer an agent with code_1C set; fall back to SD_id-based reference
+            chosen = next((a for a in agents if a.get("code_1C")), agents[0])
+            ref: Dict = {}
+            if chosen.get("code_1C"):
+                ref["code_1C"] = chosen["code_1C"]
+            elif chosen.get("SD_id"):
+                ref["SD_id"] = chosen["SD_id"]
+            SyncService._sd_default_agent[self.tenant.id] = ref
+            return ref
+        except Exception as e:
+            logger.warning("SD getAgent failed: %s", e)
+            return None
+
+    def _build_sd_client(self, name: str, phone: str, address: str = "",
+                         client_type: str = "retail", category: Dict = None,
+                         location: str = "") -> Dict:
+        """Build a Sales Doctor client dict with required fields.
+
+        location: optional "lat,lon" comma-separated GPS string. If parseable,
+        populates lat/lon for SD client (used for territory navigation).
+        """
+        code = phone or name
+        lat = ""
+        lon = ""
+        if location and "," in location:
+            try:
+                parts = [p.strip() for p in location.split(",", 1)]
+                lat = parts[0]
+                lon = parts[1] if len(parts) > 1 else ""
+            except Exception:
+                pass
+        d: Dict = {
+            "CS_id": "", "SD_id": "",
+            "code_1C": code,
+            "shortName": name,
+            "firmName": name,
+            "tel": phone,
+            "address": address,
+            "orentir": "", "comment": "",
+            "lat": lat, "lon": lon,
+            "active": "Y",
+        }
+        if category:
+            d["clientCategory"] = category
+        return d
+
     async def _ensure_sd_warehouses(self, ms_wh_codes: List[str]):
         """Register MoySklad warehouse codes in Sales Doctor.
 
@@ -677,10 +1232,13 @@ class SyncService:
             # warehouse_code_1C → list of SD product dicts
             wh_products: Dict[str, List[Dict]] = {}
 
+            skipped_no_sku = 0
             for row in stock_rows:
                 ms_id = row.get("id", "")
-                sku = row.get("code", "") or ms_id  # fallback to MS id if no SKU
+                sku = (row.get("code") or "").strip()
                 if not sku:
+                    # Don't fall back to MS UUID — it pollutes SD with opaque code_1C
+                    skipped_no_sku += 1
                     continue
                 name = row.get("name", "")
                 qty = row.get("stock", 0)
@@ -759,6 +1317,8 @@ class SyncService:
                     logger.warning("SalesDoctor setStock failed: %s", e)
 
             msg = f"Synced {synced} stock items"
+            if skipped_no_sku:
+                msg += f" (skipped {skipped_no_sku} without SKU)"
             if low_stock_items:
                 msg += f". Low stock: {', '.join(low_stock_items[:3])}"
             await self.log(LogType.SUCCESS, "Stock Sync", msg)
@@ -812,7 +1372,7 @@ class SyncService:
                         DebtRecord.client_phone == phone,
                     )
                 )
-                record = result.scalar_one_or_none()
+                record = result.scalars().first()
 
                 if record:
                     record.total_debt = total_debt
@@ -836,18 +1396,19 @@ class SyncService:
                         Client.phone == phone,
                     )
                 )
-                client = client_result.scalar_one_or_none()
+                client = client_result.scalars().first()
                 if client:
                     client.debt = remaining
                     client.total_paid = paid
 
-                if phone and remaining != 0:
+                # Push every balance, including zero, so SD reflects paid-off debts
+                if phone:
                     sd_balances.append({
                         "CS_id": "",
                         "SD_id": "",
                         "code_1C": phone,
                         "balance": remaining,
-                        "paymentType": {"CS_id": "", "SD_id": "", "code_1C": "Наличные"},
+                        "paymentType": {"CS_id": "", "SD_id": "", "code_1C": "cash"},
                     })
 
                 synced += 1

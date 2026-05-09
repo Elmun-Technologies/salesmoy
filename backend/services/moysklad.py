@@ -160,8 +160,8 @@ class MoySkladClient:
         return await self._request("GET", f"/entity/customerorder/{order_id}")
 
     async def get_customer_order_with_positions(self, order_id: str) -> Dict:
-        """Get customer order with agent and positions expanded."""
-        params = {"expand": "agent,state,positions"}
+        """Get customer order with agent, positions and product details expanded."""
+        params = {"expand": "agent,state,positions.assortment"}
         return await self._request("GET", f"/entity/customerorder/{order_id}", params=params)
 
     async def create_customer_order(self, order_data: Dict) -> Dict:
@@ -194,6 +194,64 @@ class MoySkladClient:
         """Get available states for entity type."""
         data = await self._request("GET", f"/entity/{entity_type}/metadata")
         return data.get("states", [])
+
+    # ========== Context (account info) ==========
+
+    async def get_account_id(self) -> Optional[str]:
+        """Fetch the MoySklad accountId for this token (used for webhook routing)."""
+        try:
+            data = await self._request("GET", "/context/employee")
+            return data.get("accountId")
+        except Exception:
+            return None
+
+    # ========== Webhooks ==========
+
+    async def list_webhooks(self) -> List[Dict]:
+        """List all webhooks for this account."""
+        data = await self._request("GET", "/entity/webhook", params={"limit": 100})
+        return data.get("rows", [])
+
+    async def ensure_webhooks(self, target_url: str) -> Dict[str, Any]:
+        """Idempotently register webhooks for the URL.
+
+        Creates the standard set: customerorder CREATE/UPDATE, counterparty CREATE/UPDATE.
+        Skips webhooks that already exist for the same URL+entityType+action.
+        Returns {"created": [...], "existing": [...]}.
+        """
+        wanted = [
+            ("customerorder", "CREATE"),
+            ("customerorder", "UPDATE"),
+            ("counterparty", "CREATE"),
+            ("counterparty", "UPDATE"),
+            ("demand", "CREATE"),  # Отгрузка → status "Отгружен" ga ko'chirish
+        ]
+        existing = await self.list_webhooks()
+        # Index existing by (entityType, action, url)
+        by_key = {(w.get("entityType"), w.get("action"), w.get("url")): w for w in existing}
+
+        created = []
+        already = []
+        for entity_type, action in wanted:
+            key = (entity_type, action, target_url)
+            if key in by_key:
+                already.append({"entityType": entity_type, "action": action})
+                continue
+            payload = {
+                "url": target_url,
+                "action": action,
+                "entityType": entity_type,
+                "enabled": True,
+            }
+            try:
+                resp = await self._request("POST", "/entity/webhook", json_data=payload)
+                created.append({"id": resp.get("id"), "entityType": entity_type, "action": action})
+            except Exception as e:
+                logger.warning("MS webhook create failed for %s/%s: %s", entity_type, action, e)
+        return {"created": created, "existing": already}
+
+    async def delete_webhook(self, webhook_id: str) -> None:
+        await self._request("DELETE", f"/entity/webhook/{webhook_id}")
 
     # ========== Organization & Store ==========
 

@@ -82,10 +82,16 @@ class SalesDoctorClient:
                 err = result.get("error") or {}
                 inner = result.get("result") or {}
                 completed = inner.get("completed", 0) if isinstance(inner, dict) else 0
+                # Build detailed error message from inner.failed[].error or err.data
+                detail_msg = err.get("message") or "Unknown error"
+                failed_items = inner.get("failed", []) if isinstance(inner, dict) else []
+                if failed_items:
+                    first_fail = failed_items[0]
+                    if isinstance(first_fail, dict):
+                        detail_msg = f"{first_fail.get('error', detail_msg)} (code_1C={first_fail.get('code_1C')})"
                 if completed == 0:
-                    raise SalesDoctorError(err.get("message") or result.get("message", "Unknown error"))
-                # Partial success: some items processed, log warning but don't raise
-                logger.warning("SD partial error in %s: %s", method, err.get("message"))
+                    raise SalesDoctorError(detail_msg)
+                logger.warning("SD partial error in %s: %s", method, detail_msg)
             return result.get("result", result) if isinstance(result, dict) else result
         except httpx.HTTPStatusError as e:
             logger.error("SalesDoctor HTTP %s: %s", e.response.status_code, e.response.text)
@@ -159,6 +165,21 @@ class SalesDoctorClient:
     async def get_order(self, order_cs_id: str) -> Dict:
         """Get order by CS_id."""
         return await self._rpc("getOrder", {"CS_id": order_cs_id}, include_filial=False)
+
+    async def get_orders(self, date_from: Optional[str] = None) -> List[Dict]:
+        """List all orders (optionally filtered by date)."""
+        data = {"dateFrom": date_from} if date_from else {}
+        result = await self._rpc("getOrder", data)
+        if isinstance(result, dict):
+            return result.get("order", [])
+        return []
+
+    async def get_clients(self) -> List[Dict]:
+        """List all clients in SD."""
+        result = await self._rpc("getClient", {})
+        if isinstance(result, dict):
+            return result.get("client", [])
+        return []
 
     async def set_status(self, order_code_1c: str, status_code: int) -> Dict:
         """Update order status.

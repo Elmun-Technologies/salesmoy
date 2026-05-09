@@ -38,3 +38,6 @@ ssl/
 *.pem
 *.key
 *.crt
+
+# Claude Code local settings
+.claude/

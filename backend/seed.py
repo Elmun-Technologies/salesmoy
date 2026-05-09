@@ -41,10 +41,10 @@ async def seed_demo_data():
             max_orders_monthly=5000,
             max_users=15,
             sync_interval_seconds=15,
-            moysklad_access_token="demo_moysklad_token",
-            salesdoctor_base_url="https://your-sd-server/api/v2/",
-            salesdoctor_user_id="",
-            salesdoctor_token="",
+            moysklad_access_token=None,
+            salesdoctor_base_url=None,
+            salesdoctor_user_id=None,
+            salesdoctor_token=None,
             salesdoctor_filial_id=0,
         )
         db.add(tenant)

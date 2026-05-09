@@ -2,8 +2,11 @@
 
 import asyncio
 import logging
+import os
+import socket
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -109,6 +112,7 @@ async def client_sync_loop():
                         service = SyncService(db, tenant)
                         await service.init_clients()
                         await service.sync_clients_from_moysklad()
+                        await service.sync_clients_from_salesdoctor()
                     except Exception as e:
                         logger.error(f"Client sync error for tenant {tenant.id}: {e}")
 
@@ -137,6 +141,7 @@ async def order_sync_loop():
                         service = SyncService(db, tenant)
                         await service.init_clients()
                         await service.sync_orders_from_moysklad()
+                        await service.sync_orders_from_salesdoctor()
                     except Exception as e:
                         logger.error(f"Order sync error for tenant {tenant.id}: {e}")
 
@@ -158,9 +163,34 @@ async def lifespan(app: FastAPI):
     # Background sync — TEST_MODE=true bo'lsa o'chiriladi (xavfsiz test uchun)
     test_mode = settings.test_mode
 
+    # Single-worker leader election: only one uvicorn worker should run background sync.
+    # fcntl.flock auto-releases when the process dies, so stale locks are not an issue.
+    import fcntl
+    leader = False
+    lock_path = Path("/tmp/salesmoy_sync_leader.lock")
+    lock_fd = None
+    try:
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.ftruncate(lock_fd, 0)
+        os.write(lock_fd, f"{os.getpid()}@{socket.gethostname()}".encode())
+        leader = True
+    except (BlockingIOError, OSError):
+        # Lock held by another worker
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except Exception:
+                pass
+            lock_fd = None
+        leader = False
+
     if test_mode:
         tasks = []
         logger.info("🧪 TEST MODE — background sync o'chirilgan, qo'lda test qiling")
+    elif not leader:
+        tasks = []
+        logger.info(f"⛔ Worker pid={os.getpid()} — not the sync leader; background sync skipped")
     else:
         tasks = [
             asyncio.create_task(stock_sync_loop()),
@@ -168,7 +198,7 @@ async def lifespan(app: FastAPI):
             asyncio.create_task(client_sync_loop()),
             asyncio.create_task(order_sync_loop()),
         ]
-        logger.info("📡 Background sync started for all tenants (stock, debts, clients, orders)")
+        logger.info(f"📡 Background sync started (leader pid={os.getpid()}) — stock, debts, clients, orders")
 
     yield
 
@@ -178,6 +208,11 @@ async def lifespan(app: FastAPI):
         task.cancel()
     await close_moysklad_client()
     await close_salesdoctor_client()
+    if leader and lock_fd is not None:
+        try:
+            os.close(lock_fd)
+        except Exception:
+            pass
 
 
 # ========== FastAPI App ==========
@@ -212,6 +247,7 @@ app.include_router(delivery.router)
 app.include_router(agents.router)
 app.include_router(logs.router)
 app.include_router(webhooks.router)
+app.include_router(webhooks.mgmt_router)
 
 
 # ========== Root Endpoints ==========

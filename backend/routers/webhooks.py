@@ -13,6 +13,8 @@ from services.sync import SyncService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
+# Authenticated management endpoints — separate router so they go through tenant auth.
+mgmt_router = APIRouter(prefix="/api/integrations/moysklad", tags=["Integrations"])
 
 
 # ========== MoySklad Webhooks ==========
@@ -98,10 +100,60 @@ async def moysklad_webhook(
                         logger.error("Failed to update order status %s: %s", entity_id, e)
 
         elif "counterparty" in entity_type:
-            await service.log(LogType.INFO, "Webhook", f"Counterparty {action}: {entity_id}")
+            # Mijoz MS'da yaratildi/yangilandi → SD'ga push
+            try:
+                if service.ms and action in ("CREATE", "UPDATE"):
+                    cp = await service.ms.get_counterparty(entity_id)
+                    cp_name = (cp.get("name") or "").strip()
+                    cp_phone = (cp.get("phone") or "").strip()
+                    if cp_name:
+                        # Local DB ga upsert
+                        from sqlalchemy import select as sa_select
+                        from models import Client, ClientType
+                        from datetime import datetime
+                        local = None
+                        if cp_phone:
+                            r = await service.db.execute(sa_select(Client).where(
+                                Client.tenant_id == tenant.id,
+                                Client.phone == cp_phone,
+                                Client.is_duplicate == False))
+                            local = r.scalars().first()
+                        if not local:
+                            local = Client(tenant_id=tenant.id, name=cp_name, phone=cp_phone)
+                            service.db.add(local)
+                        local.moysklad_id = entity_id
+                        local.name = cp_name
+                        local.address = cp.get("actualAddress", "") or local.address
+                        await service.db.commit()
+                        # SD ga push
+                        if service.sd:
+                            category = await service._get_sd_category_id("retail")
+                            sd_client = service._build_sd_client(
+                                name=cp_name, phone=cp_phone,
+                                address=cp.get("actualAddress", ""),
+                                client_type="retail", category=category,
+                            )
+                            try:
+                                await service.sd.set_client([sd_client])
+                            except Exception as e:
+                                await service.log(LogType.WARNING, "Webhook", f"SD setClient failed: {e}")
+                    await service.log(LogType.SUCCESS, "Webhook", f"Counterparty {action} → SD: {cp_name}")
+            except Exception as e:
+                await service.log(LogType.ERROR, "Webhook", f"Counterparty {action} failed: {e}")
 
         elif "demand" in entity_type:
-            await service.log(LogType.INFO, "Webhook", f"Demand {action}: {entity_id}")
+            # Demand (отгрузка) yaratildi → MS buyurtma statusini "Отгружен" ga o'tkazib SD'ga ham yuboramiz
+            try:
+                if service.ms and action == "CREATE":
+                    demand = await service.ms._request("GET", f"/entity/demand/{entity_id}",
+                                                      params={"expand": "customerOrder"})
+                    co = demand.get("customerOrder") or {}
+                    co_id = co.get("id") if isinstance(co, dict) else ""
+                    if co_id:
+                        await service.update_order_status_from_moysklad(co_id, "Отгружен")
+                await service.log(LogType.SUCCESS, "Webhook", f"Demand {action}: {entity_id}")
+            except Exception as e:
+                await service.log(LogType.ERROR, "Webhook", f"Demand {action} failed: {e}")
 
     event.processed = True
     event.processed_at = datetime.utcnow()
@@ -173,6 +225,141 @@ async def salesdoctor_webhook(
     await db.commit()
 
     return {"status": "ok"}
+
+
+# ========== Tenant-facing webhook management ==========
+
+
+@mgmt_router.get("/webhook/status")
+async def moysklad_webhook_status(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Show whether MoySklad webhooks are registered for this tenant."""
+    from config import get_settings
+    tenant_id = getattr(request.state, "tenant_id", None)
+    if not tenant_id:
+        return {"connected": False, "reason": "not authenticated"}
+
+    result = await db.execute(select(Tenant).where(Tenant.id == int(tenant_id)))
+    tenant = result.scalar_one_or_none()
+    if not tenant or not tenant.moysklad_access_token:
+        return {"connected": False, "reason": "MoySklad not connected"}
+
+    settings = get_settings()
+    base = settings.public_base_url.rstrip("/")
+    target = f"{base}/api/webhook/moysklad" if base else None
+
+    from services.moysklad import MoySkladClient
+    client = MoySkladClient(token=tenant.moysklad_access_token)
+    try:
+        existing = await client.list_webhooks()
+    finally:
+        await client.close()
+
+    matching = [w for w in existing if target and w.get("url") == target]
+    return {
+        "connected": bool(matching),
+        "public_base_url": base,
+        "target_url": target,
+        "registered_count": len(matching),
+        "registered": [
+            {"id": w.get("id"), "entityType": w.get("entityType"),
+             "action": w.get("action"), "enabled": w.get("enabled")}
+            for w in matching
+        ],
+        "all_webhooks_count": len(existing),
+    }
+
+
+@mgmt_router.post("/webhook/register")
+async def moysklad_webhook_register(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Register the standard set of MoySklad webhooks for this tenant.
+
+    Idempotent — existing webhooks for the same URL are kept.
+    Requires PUBLIC_BASE_URL to be set (HTTPS) in server config.
+    """
+    from config import get_settings
+    tenant_id = getattr(request.state, "tenant_id", None)
+    if not tenant_id:
+        return {"success": False, "error": "Not authenticated"}
+
+    result = await db.execute(select(Tenant).where(Tenant.id == int(tenant_id)))
+    tenant = result.scalar_one_or_none()
+    if not tenant or not tenant.moysklad_access_token:
+        return {"success": False, "error": "MoySklad not connected for this tenant"}
+
+    settings = get_settings()
+    base = (settings.public_base_url or "").rstrip("/")
+    if not base or not base.startswith("https://"):
+        return {
+            "success": False,
+            "error": "PUBLIC_BASE_URL not configured or not HTTPS — set it in server .env",
+            "current": base or None,
+        }
+    target_url = f"{base}/api/webhook/moysklad"
+
+    from services.moysklad import MoySkladClient
+    client = MoySkladClient(token=tenant.moysklad_access_token)
+    try:
+        # Persist accountId on first registration
+        if not tenant.moysklad_account_id:
+            account_id = await client.get_account_id()
+            if account_id:
+                tenant.moysklad_account_id = account_id
+                await db.commit()
+
+        result = await client.ensure_webhooks(target_url)
+    finally:
+        await client.close()
+
+    return {
+        "success": True,
+        "target_url": target_url,
+        "created": result["created"],
+        "already_existed": result["existing"],
+    }
+
+
+@mgmt_router.delete("/webhook/unregister")
+async def moysklad_webhook_unregister(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove all webhooks pointing at our public URL for this tenant."""
+    from config import get_settings
+    tenant_id = getattr(request.state, "tenant_id", None)
+    if not tenant_id:
+        return {"success": False, "error": "Not authenticated"}
+
+    result = await db.execute(select(Tenant).where(Tenant.id == int(tenant_id)))
+    tenant = result.scalar_one_or_none()
+    if not tenant or not tenant.moysklad_access_token:
+        return {"success": False, "error": "MoySklad not connected"}
+
+    settings = get_settings()
+    base = (settings.public_base_url or "").rstrip("/")
+    target_url = f"{base}/api/webhook/moysklad" if base else None
+
+    from services.moysklad import MoySkladClient
+    client = MoySkladClient(token=tenant.moysklad_access_token)
+    removed = []
+    try:
+        existing = await client.list_webhooks()
+        for w in existing:
+            if target_url and w.get("url") == target_url:
+                try:
+                    await client.delete_webhook(w["id"])
+                    removed.append({"id": w["id"], "entityType": w.get("entityType"),
+                                    "action": w.get("action")})
+                except Exception as e:
+                    logger.warning("MS webhook delete failed: %s", e)
+    finally:
+        await client.close()
+    return {"success": True, "removed": removed}
 
 
 # ========== Health Check ==========
