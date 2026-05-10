@@ -187,5 +187,4 @@ async def get_monthly_stats(request: Request, db: AsyncSession = Depends(get_db)
     return {
         "monthlyOrders": monthly_count,
         "monthlyRevenue": monthly_revenue,
-        "maxOrders": (await db.execute(select(Tenant).where(Tenant.id == tenant_id))).scalar_one().max_orders_monthly,
     }

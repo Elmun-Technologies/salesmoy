@@ -1,7 +1,5 @@
 """Tenant + JWT middleware for multi-tenant API."""
 
-from datetime import datetime
-
 import jwt
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -9,7 +7,7 @@ from sqlalchemy import select
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from database import AsyncSessionLocal
-from models import Tenant, SubscriptionPlan
+from models import Tenant
 from security.jwt_tokens import decode_access_token
 
 
@@ -27,10 +25,6 @@ def _is_public_path(path: str, method: str) -> bool:
     if path == "/api/auth/login" and method == "POST":
         return True
     if path.startswith("/api/auth/moysklad"):
-        return True
-    if path == "/api/billing/webhook" and method == "POST":
-        return True
-    if path == "/api/billing/plans" and method == "GET":
         return True
     if path.startswith("/webhook"):
         return True
@@ -92,20 +86,6 @@ class TenantMiddleware(BaseHTTPMiddleware):
                         status_code=401,
                         content={"detail": "Tenant not found or inactive"},
                     )
-
-                # Subscription check
-                now = datetime.utcnow()
-                if tenant.is_trial and tenant.trial_ends_at and tenant.trial_ends_at < now:
-                    return JSONResponse(
-                        status_code=403,
-                        content={"detail": "Trial expired. Please upgrade your plan."},
-                    )
-                if tenant.plan != SubscriptionPlan.FREE:
-                    if tenant.plan_expires_at and tenant.plan_expires_at < now:
-                        return JSONResponse(
-                            status_code=403,
-                            content={"detail": "Subscription expired"},
-                        )
 
                 request.state.tenant = tenant
                 request.state.tenant_id = tenant.id

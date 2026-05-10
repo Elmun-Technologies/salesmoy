@@ -815,10 +815,6 @@ class SyncService:
                     Order.created_at >= current_month
                 )
             )
-            if self.tenant.max_orders_monthly > 0 and order_count.scalar() >= self.tenant.max_orders_monthly:
-                await self.log(LogType.WARNING, "Order Sync", "Monthly order limit reached")
-                return None
-
             # Find or create counterparty
             counterparties = await self.ms.get_counterparties(phone=client_phone)
             if counterparties:
