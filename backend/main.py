@@ -224,13 +224,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS middleware
+# CORS middleware — allow configured origins + wildcard for public endpoints
+_cors_origins = settings.get_cors_origins()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.get_cors_origins(),
+    allow_origins=_cors_origins if _cors_origins else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Tenant middleware (multi-tenancy)
@@ -276,6 +278,7 @@ async def root():
 
 
 @app.get("/health")
+@app.get("/api/health")
 async def health_check():
     """Health check endpoint."""
     return {
