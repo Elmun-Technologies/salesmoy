@@ -1415,14 +1415,17 @@ class SyncService:
 
             await self.db.commit()
 
-            # Single batched call to SD (avoids 429 rate limit)
+            # Batched calls to SD with delay to avoid 429 rate limit
             if self.sd and sd_balances:
-                try:
-                    batch_size = 100
-                    for i in range(0, len(sd_balances), batch_size):
+                batch_size = 100
+                for i in range(0, len(sd_balances), batch_size):
+                    try:
                         await self.sd.set_current_balance(sd_balances[i:i + batch_size])
-                except Exception as e:
-                    logger.warning("SalesDoctor balance sync failed: %s", e)
+                        if i + batch_size < len(sd_balances):
+                            await asyncio.sleep(2)  # 2s pause between batches → no 429
+                    except Exception as e:
+                        logger.warning("SalesDoctor balance sync failed (batch %d): %s", i // batch_size + 1, e)
+                        await asyncio.sleep(5)  # longer pause after error
 
             await self.log(LogType.SUCCESS, "Debt Sync", f"Synced debts for {synced} clients")
 

@@ -44,7 +44,7 @@ async def stock_sync_loop():
 
     while True:
         try:
-            await asyncio.sleep(15)
+            await asyncio.sleep(60)  # 60s: reduce CPU from 67% → ~15%
             async with AsyncSessionLocal() as db:
                 result = await db.execute(
                     select(Tenant).where(Tenant.is_active == True)
