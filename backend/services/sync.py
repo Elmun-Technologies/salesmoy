@@ -491,7 +491,7 @@ class SyncService:
                 order.sync_status = SyncStatus.SYNCED
                 order.synced_at = datetime.utcnow()
             except Exception as e:
-                order.sync_status = SyncStatus.FAILED
+                order.sync_status = SyncStatus.ERROR
                 await self.log(LogType.ERROR, "Order Sync",
                                f"setOrder failed for {order_name}: {e}")
 
@@ -504,7 +504,7 @@ class SyncService:
 
         Only fetches orders from the last 24 hours. Historical orders are not
         imported automatically — they can be synced on demand if the client requests.
-        Also retries SD push for any DB orders that don't have salesdoctor_id yet.
+        Also retries SD push for any DB orders that are still PENDING (no salesdoctor_id).
         """
         if not self.ms:
             return
@@ -544,6 +544,41 @@ class SyncService:
             if synced > 0:
                 await self.log(LogType.SUCCESS, "Order Sync",
                                f"Synced {synced} new orders from MoySklad")
+
+            # ── Retry PENDING orders (pushed to DB but never pushed to SD) ──
+            # This handles orders that were imported when SD was not configured,
+            # or when the first setOrder call failed silently.
+            if self.sd:
+                pending_result = await self.db.execute(
+                    select(Order).where(
+                        Order.tenant_id == self.tenant.id,
+                        Order.sync_status == SyncStatus.PENDING,
+                        Order.moysklad_id.isnot(None),
+                    ).limit(20)  # process at most 20 retries per cycle
+                )
+                pending_orders = pending_result.scalars().all()
+
+                retried = 0
+                for pending in pending_orders:
+                    try:
+                        ms_order_full = await self.ms.get_customer_order_with_positions(pending.moysklad_id)
+                        await self._push_order_to_sd(pending, ms_order_full)
+                        pending.sync_status = SyncStatus.SYNCED
+                        pending.synced_at = datetime.utcnow()
+                        await self.db.commit()
+                        retried += 1
+                    except Exception as e:
+                        logger.warning("Retry failed for order %s: %s", pending.order_id, e)
+                        try:
+                            await self.db.rollback()
+                            pending.sync_status = SyncStatus.ERROR
+                            await self.db.commit()
+                        except Exception:
+                            pass  # don't let rollback failure break the loop
+
+                if retried > 0:
+                    await self.log(LogType.SUCCESS, "Order Sync",
+                                   f"Retried {retried} pending orders → SD")
 
         except Exception as e:
             await self.log(LogType.ERROR, "Order Sync", f"sync_orders_from_moysklad failed: {e}")
