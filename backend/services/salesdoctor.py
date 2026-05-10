@@ -83,12 +83,18 @@ class SalesDoctorClient:
                 inner = result.get("result") or {}
                 completed = inner.get("completed", 0) if isinstance(inner, dict) else 0
                 # Build detailed error message from inner.failed[].error or err.data
-                detail_msg = err.get("message") or "Unknown error"
+                detail_msg = err.get("message") or err.get("data") or "Unknown error"
                 failed_items = inner.get("failed", []) if isinstance(inner, dict) else []
                 if failed_items:
                     first_fail = failed_items[0]
                     if isinstance(first_fail, dict):
-                        detail_msg = f"{first_fail.get('error', detail_msg)} (code_1C={first_fail.get('code_1C')})"
+                        fail_error = first_fail.get("error") or first_fail.get("message") or detail_msg
+                        fail_code = first_fail.get("code_1C") or first_fail.get("SD_id") or "?"
+                        detail_msg = f"{fail_error} (code_1C={fail_code})"
+                # Include raw response snippet for generic "FAILED" messages
+                if detail_msg in ("FAILED", "Unknown error", ""):
+                    raw_snippet = str(result)[:300]
+                    detail_msg = f"SD returned error for [{method}]: {raw_snippet}"
                 if completed == 0:
                     raise SalesDoctorError(detail_msg)
                 logger.warning("SD partial error in %s: %s", method, detail_msg)
