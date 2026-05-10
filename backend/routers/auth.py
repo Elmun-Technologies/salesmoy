@@ -98,7 +98,7 @@ async def _auto_register_webhooks(tenant: Tenant, db: AsyncSession) -> None:
         logger.info("Skipping auto-webhook registration: PUBLIC_BASE_URL not HTTPS (%s)", base)
         return
 
-    target_url = f"{base}/api/webhook/moysklad"
+    target_url = f"{base}/webhook/moysklad"
     client = MoySkladClient(token=tenant.moysklad_access_token)
     try:
         # Fetch and store accountId so webhook routing works immediately

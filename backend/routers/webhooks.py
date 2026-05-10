@@ -248,7 +248,7 @@ async def moysklad_webhook_status(
 
     settings = get_settings()
     base = settings.public_base_url.rstrip("/")
-    target = f"{base}/api/webhook/moysklad" if base else None
+    target = f"{base}/webhook/moysklad" if base else None
 
     from services.moysklad import MoySkladClient
     client = MoySkladClient(token=tenant.moysklad_access_token)
@@ -300,7 +300,7 @@ async def moysklad_webhook_register(
             "error": "PUBLIC_BASE_URL not configured or not HTTPS — set it in server .env",
             "current": base or None,
         }
-    target_url = f"{base}/api/webhook/moysklad"
+    target_url = f"{base}/webhook/moysklad"
 
     from services.moysklad import MoySkladClient
     client = MoySkladClient(token=tenant.moysklad_access_token)
@@ -342,7 +342,7 @@ async def moysklad_webhook_unregister(
 
     settings = get_settings()
     base = (settings.public_base_url or "").rstrip("/")
-    target_url = f"{base}/api/webhook/moysklad" if base else None
+    target_url = f"{base}/webhook/moysklad" if base else None
 
     from services.moysklad import MoySkladClient
     client = MoySkladClient(token=tenant.moysklad_access_token)

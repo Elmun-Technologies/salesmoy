@@ -18,7 +18,6 @@
 - [Yangi tenant onboarding](#yangi-tenant-onboarding)
 - [Fon sinxronizatsiya jadvali](#fon-sinxronizatsiya-jadvali)
 - [Webhook oqimi](#webhook-oqimi)
-- [Obuna rejalari](#obuna-rejalari)
 - [Docker bilan deploy](#docker-bilan-deploy)
 - [Ma'lumotlar bazasi sxemasi](#ma'lumotlar-bazasi-sxemasi)
 
@@ -183,7 +182,7 @@ Har 60 sekundda har bir tenant uchun
 │   │   ├── agents.py            # Savdo agentlari
 │   │   ├── logs.py              # Sinxron faoliyat loglari
 │   │   ├── webhooks.py          # MoySklad va SD webhook qabul qiluvchi + boshqaruv
-│   │   └── billing.py           # Obuna va to'lov endpointlari
+│   │   └── billing.py           # (disabled)
 │   ├── services/
 │   │   ├── sync.py              # SyncService — barcha sinxron logikasi
 │   │   ├── moysklad.py          # MoySkladClient (httpx + tenacity)
@@ -343,14 +342,6 @@ UI: http://localhost:5173
 | `POST` | `/api/integrations/moysklad/webhook/register` | Webhooklarni ro'yxatdan o'tkazish/yangilash |
 | `DELETE` | `/api/integrations/moysklad/webhook/unregister` | Barcha webhooklarni o'chirish |
 
-### Billing
-
-| Metod | Endpoint | Tavsif |
-|---|---|---|
-| `GET` | `/api/billing/plans` | Mavjud obuna rejalari |
-| `POST` | `/api/billing/checkout` | To'lov yaratish (Payme / Click / YooKassa) |
-| `GET` | `/api/billing/status` | Joriy obuna holati |
-
 ### Health
 
 | Metod | Endpoint | Tavsif |
@@ -440,19 +431,6 @@ Backend: SELECT tenant WHERE moysklad_account_id = 'abc123'
 
 ---
 
-## Obuna Rejalari
-
-| Reja | Oylik Zakazlar | Foydalanuvchilar | Sinxron Intervali | Narx |
-|---|---|---|---|---|
-| Free (Sinov) | 100 | 2 | 60 s | 0 so'm (14 kun) |
-| Basic | 1 000 | 5 | 60 s | — |
-| Pro | 10 000 | 20 | 30 s | — |
-| Enterprise | Cheksiz | Cheksiz | 15 s | — |
-
-To'lov tizimi: **Payme**, **Click** (O'zbekiston), **YooKassa** (Rossiya).
-
----
-
 ## Docker bilan Deploy
 
 ### 1. Klonlash va sozlash
@@ -518,7 +496,6 @@ debt_records     — klient qarz balanslari
 deliveries       — jo'natmalarni kuzatish
 sync_logs        — barcha sinxron operatsiyalarning to'liq audit izi
 webhook_events   — xom webhook payloadlari (debugging va replay uchun)
-payments         — obuna to'lov yozuvlari
 ```
 
 Barcha jadvallar to'liq satr darajasida ma'lumot izolyatsiyasi uchun `tenant_id` FK ni o'z ichiga oladi.
