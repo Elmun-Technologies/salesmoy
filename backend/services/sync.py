@@ -1,5 +1,6 @@
 """Core synchronization logic between MoySklad and Sales Doctor (Tenant-aware)."""
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
