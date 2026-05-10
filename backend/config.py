@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     webhook_secret: str = ""
     webhook_url: str = ""
     # Public HTTPS base URL of this server (e.g. https://salesmoy.example.com).
-    # Used to auto-register MoySklad webhooks pointing at /api/webhook/moysklad.
+    # Used to auto-register MoySklad webhooks pointing at /webhook/moysklad.
     public_base_url: str = ""
 
     # Database

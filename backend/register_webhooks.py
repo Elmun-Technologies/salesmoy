@@ -30,7 +30,7 @@ async def register_all():
             print(f"❌ PUBLIC_BASE_URL not HTTPS: {base}")
             return
 
-        target_url = f"{base}/api/webhook/moysklad"
+        target_url = f"{base}/webhook/moysklad"
         print(f"📡 Target URL: {target_url}")
 
         for tenant in tenants:
