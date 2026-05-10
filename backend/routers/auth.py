@@ -16,7 +16,7 @@ from passlib.context import CryptContext
 
 from config import get_settings
 from database import get_db
-from models import Tenant, User, SubscriptionPlan
+from models import Tenant, User
 from security.jwt_tokens import (
     create_access_token,
     create_moysklad_oauth_state_token,
@@ -140,11 +140,6 @@ async def register(data: RegisterRequest, db: AsyncSession = Depends(get_db)):
         slug=data.slug,
         email=data.email,
         phone=data.phone,
-        plan=SubscriptionPlan.FREE,
-        is_trial=True,
-        trial_ends_at=datetime.utcnow() + timedelta(days=14),
-        max_orders_monthly=100,
-        max_users=2,
         sync_interval_seconds=60,
     )
     db.add(tenant)
@@ -176,10 +171,8 @@ async def register(data: RegisterRequest, db: AsyncSession = Depends(get_db)):
             "id": tenant.id,
             "name": tenant.name,
             "slug": tenant.slug,
-            "plan": tenant.plan.value,
-            "trial_ends_at": tenant.trial_ends_at.isoformat(),
         },
-        "message": "Registration successful. 14-day free trial started.",
+        "message": "Ro'yxatdan o'tish muvaffaqiyatli.",
     }
 
 
@@ -215,8 +208,6 @@ async def login(data: LoginRequest, db: AsyncSession = Depends(get_db)):
             "id": tenant.id,
             "name": tenant.name,
             "slug": tenant.slug,
-            "plan": tenant.plan.value,
-            "plan_expires_at": tenant.plan_expires_at.isoformat() if tenant.plan_expires_at else None,
         },
     }
 
@@ -401,9 +392,6 @@ async def get_current_user(request: Request, db: AsyncSession = Depends(get_db))
             "id": tenant.id,
             "name": tenant.name,
             "slug": tenant.slug,
-            "plan": tenant.plan.value,
-            "is_trial": tenant.is_trial,
-            "trial_ends_at": tenant.trial_ends_at.isoformat() if tenant.trial_ends_at else None,
             "moysklad_connected": bool(tenant.moysklad_access_token),
             "salesdoctor_connected": bool(tenant.salesdoctor_token),
             "salesdoctor_base_url": tenant.salesdoctor_base_url or "",

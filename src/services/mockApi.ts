@@ -14,29 +14,9 @@ const DEMO_TENANT = {
     id: 1,
     name: "Demo Kompaniya",
     slug: "demo",
-    plan: "pro",
     moysklad_connected: true,
     salesdoctor_connected: true,
   }
-};
-
-const DEMO_BILLING = {
-  plan: "pro",
-  plan_name: "Профессиональный",
-  is_trial: true,
-  limits: {
-    max_orders_monthly: 5000,
-    max_users: 15,
-    sync_interval_seconds: 15,
-  },
-  features: ["Синхронизация каждые 15 сек", "API доступ", "Расширенные отчеты", "Webhook"],
-};
-
-const PLANS = {
-  free: { name: "Бесплатный", price_uzs: 0, features: ["Базовая синхронизация", "Email поддержка"] },
-  basic: { name: "Базовый", price_uzs: 290000, features: ["Синхронизация каждые 30 сек", "Приоритетная поддержка", "Отчеты"] },
-  pro: { name: "Профессиональный", price_uzs: 590000, features: ["Синхронизация каждые 15 сек", "API доступ", "Расширенные отчеты", "Webhook"] },
-  enterprise: { name: "Корпоративный", price_uzs: 1490000, features: ["Синхронизация каждые 5 сек", "Выделенный менеджер", "Custom интеграции", "SLA"] },
 };
 
 export const mockLogin = async (data: any) => {
@@ -63,9 +43,6 @@ export const mockRegister = async (_data: any) => {
 };
 
 export const mockGetMe = async () => DEMO_TENANT;
-export const mockGetPlans = async () => ({ plans: PLANS });
-export const mockGetBillingStatus = async () => DEMO_BILLING;
-export const mockGetPaymentHistory = async () => [];
 
 export const mockGetOrders = async () => mockOrders.map(o => ({
   id: o.id,

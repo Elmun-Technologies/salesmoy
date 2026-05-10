@@ -17,7 +17,7 @@ from sqlalchemy import (
     JSON,
     Index,
 )
-from sqlalchemy.orm import relationship, declared_attr
+from sqlalchemy.orm import relationship
 
 from database import Base
 
@@ -51,20 +51,6 @@ class LogType(str, enum.Enum):
     ERROR = "error"
 
 
-class SubscriptionPlan(str, enum.Enum):
-    FREE = "free"
-    BASIC = "basic"
-    PRO = "pro"
-    ENTERPRISE = "enterprise"
-
-
-class PaymentStatus(str, enum.Enum):
-    PENDING = "pending"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    REFUNDED = "refunded"
-
-
 # ========== Tenant (Multi-Tenancy) ==========
 
 class Tenant(Base):
@@ -90,16 +76,7 @@ class Tenant(Base):
     salesdoctor_token = Column(Text, nullable=True)
     salesdoctor_filial_id = Column(Integer, default=0)
 
-    # Subscription
-    plan = Column(Enum(SubscriptionPlan), default=SubscriptionPlan.FREE)
-    plan_expires_at = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
-    is_trial = Column(Boolean, default=True)
-    trial_ends_at = Column(DateTime, nullable=True)
-
-    # Limits
-    max_orders_monthly = Column(Integer, default=100)
-    max_users = Column(Integer, default=2)
     sync_interval_seconds = Column(Integer, default=60)
 
     # Webhook
@@ -117,7 +94,6 @@ class Tenant(Base):
     debt_records = relationship("DebtRecord", back_populates="tenant")
     deliveries = relationship("Delivery", back_populates="tenant")
     sync_logs = relationship("SyncLog", back_populates="tenant")
-    payments = relationship("Payment", back_populates="tenant")
 
 
 # ========== User ==========
@@ -316,23 +292,3 @@ class WebhookEvent(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     processed_at = Column(DateTime, nullable=True)
 
-
-# ========== Payment ==========
-
-class Payment(Base):
-    __tablename__ = "payments"
-
-    id = Column(Integer, primary_key=True, index=True)
-    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
-    amount = Column(Float, nullable=False)
-    currency = Column(String(10), default="UZS")
-    provider = Column(String(50), nullable=False)  # payme, click, yookassa
-    status = Column(Enum(PaymentStatus), default=PaymentStatus.PENDING)
-    external_id = Column(String(255), nullable=True)
-    description = Column(String(500), nullable=True)
-    plan_slug = Column(String(50), nullable=True)  # basic, pro, enterprise — set at checkout
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-    completed_at = Column(DateTime, nullable=True)
-
-    tenant = relationship("Tenant", back_populates="payments")

@@ -7,17 +7,12 @@ import {
   Globe,
   Database,
   RefreshCw,
-  CreditCard,
-  Zap,
-  Crown,
   Building2,
   Webhook,
   AlertTriangle,
 } from 'lucide-react';
 import {
   getMe,
-  getPlans,
-  getBillingStatus,
   connectMoySklad,
   connectSalesDoctor,
   startMoySkladOAuth,
@@ -26,86 +21,9 @@ import {
   unregisterMoySkladWebhooks,
 } from '../services/api';
 
-const DEFAULT_PLANS: Record<string, any> = {
-  free: {
-    name: 'Sinov',
-    badge: null,
-    tagline: 'Integratsiyani bepul sinab ko\'ring',
-    price_uzs: 0,
-    price_rub: 0,
-    features: [
-      '300 ta zakaz / oy',
-      'Har 5 daqiqada sinxron',
-      '1 ta filial',
-      'MoySklad → Sales Doctor zakazlar',
-      'Qoldiqlarni ko\'rish',
-      'Email yordam',
-    ],
-    limits: ['Qarzdorlik bloki yo\'q', 'Webhook yo\'q'],
-  },
-  basic: {
-    name: 'Biznes',
-    badge: null,
-    tagline: 'O\'sib borayotgan kompaniyalar uchun',
-    price_uzs: 290000,
-    price_rub: 1900,
-    features: [
-      'Cheksiz zakazlar',
-      'Har 30 soniyada sinxron',
-      '5 ta filial',
-      'Zakazlar avtomatik uzatiladi',
-      'Agentlar uchun real vaqt qoldiq',
-      'Qarzdor mijozga zakaz bloki',
-      'Yetkazib berish kuzatuvi',
-      'Prioritet yordam',
-    ],
-    limits: [],
-  },
-  pro: {
-    name: 'Professional',
-    badge: 'Eng mashhur',
-    tagline: 'Faol savdo tarmoqlari uchun',
-    price_uzs: 590000,
-    price_rub: 3900,
-    features: [
-      'Cheksiz zakazlar',
-      'Har 15 soniyada sinxron',
-      '15 ta filial',
-      'Barcha Biznes imkoniyatlari',
-      'Mijozlar ikki tomonlama sinxron',
-      'Kengaytirilgan hisobotlar',
-      'Webhook integratsiyasi',
-      'API ulanishi',
-      'Telegram bildirishnomalar',
-    ],
-    limits: [],
-  },
-  enterprise: {
-    name: 'Korporativ',
-    badge: null,
-    tagline: 'Yirik tarqatuvchi kompaniyalar uchun',
-    price_uzs: 1490000,
-    price_rub: 9900,
-    features: [
-      'Cheksiz zakazlar',
-      'Har 5 soniyada sinxron (real vaqt)',
-      'Cheksiz filiallar',
-      'Barcha Professional imkoniyatlari',
-      'Shaxsiy menejer',
-      'Maxsus integratsiyalar',
-      'SLA kafolati (99.9% uptime)',
-      '24/7 qo\'llab-quvvatlash',
-      'Onboarding va o\'rgatish',
-    ],
-    limits: [],
-  },
-};
-
 export default function SettingsPanel() {
   const [saved, setSaved] = useState(false);
   const [tenant, setTenant] = useState<any>(null);
-  const [plans, setPlans] = useState<any>({});
-  const [billing, setBilling] = useState<any>(null);
   const [loading, setLoading] = useState(true);
 
   // Connection inputs
@@ -157,17 +75,10 @@ export default function SettingsPanel() {
   useEffect(() => {
     async function load() {
       try {
-        const [me, plansData, billingData] = await Promise.all([
-          getMe(),
-          getPlans(),
-          getBillingStatus(),
-        ]);
+        const me = await getMe();
         setTenant(me.tenant);
         if (me.tenant?.salesdoctor_base_url) setSdBaseUrl(me.tenant.salesdoctor_base_url);
         if (me.tenant?.salesdoctor_login) setSdLogin(me.tenant.salesdoctor_login);
-        setPlans(plansData.plans);
-        setBilling(billingData);
-        // Webhook status — only meaningful if MS connected
         if (me.tenant?.moysklad_connected) {
           await refreshWebhookStatus();
         }
@@ -264,10 +175,6 @@ export default function SettingsPanel() {
             <span className="ml-2 font-medium text-slate-900">{tenant?.slug}</span>
           </div>
           <div>
-            <span className="text-slate-400">Tarif:</span>
-            <span className="ml-2 font-medium text-emerald-600">{billing?.plan_name || 'Bepul'}</span>
-          </div>
-          <div>
             <span className="text-slate-400">MoySklad:</span>
             <span className={`ml-2 font-medium ${tenant?.moysklad_connected ? 'text-emerald-600' : 'text-red-500'}`}>
               {tenant?.moysklad_connected ? 'Ulangan' : 'Ulanmagan'}
@@ -300,8 +207,15 @@ export default function SettingsPanel() {
         </div>
 
         <div className="space-y-4">
+          <button
+            onClick={handleMoySkladMarketplaceOAuth}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-100 hover:bg-blue-200 text-blue-700 rounded-lg text-sm font-medium transition-colors"
+          >
+            <Globe className="w-4 h-4" />
+            MoySklad Marketplace OAuth orqali ulash
+          </button>
           <p className="text-xs text-slate-500">
-            Yoki qo‘lda access token kiriting (JSON dagi <code className="bg-slate-100 px-1 rounded">access_token</code>{' '}
+            Yoki qo’lda access token kiriting (JSON dagi <code className="bg-slate-100 px-1 rounded">access_token</code>{‘ ‘}
             qiymati):
           </p>
 
@@ -490,119 +404,6 @@ export default function SettingsPanel() {
             <CheckCircle2 className="w-4 h-4" />
             {tenant?.salesdoctor_connected ? 'Yangilash' : 'Ulash'}
           </button>
-        </div>
-      </motion.div>
-
-      {/* Pricing Plans */}
-      <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.3 }}
-        className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm"
-      >
-        <div className="mb-6">
-          <h3 className="text-xl font-bold text-slate-900">Tariflar</h3>
-          <p className="text-sm text-slate-500 mt-1">
-            Hamma tarifda: MoySklad ↔ Sales Doctor integratsiya, zakazlar avtomatik uzatish, qoldiqlar nazorati
-          </p>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-          {Object.entries(plans && Object.keys(plans).length > 0 ? plans : DEFAULT_PLANS).map(([key, plan]: [string, any]) => {
-            const isCurrent = billing?.plan === key;
-            const isPro = key === 'pro';
-            const isEnterprise = key === 'enterprise';
-            return (
-              <div
-                key={key}
-                className={`relative rounded-xl border-2 p-5 flex flex-col transition-all ${
-                  isCurrent
-                    ? 'border-emerald-500 bg-emerald-50/60 shadow-md'
-                    : isPro
-                    ? 'border-amber-400 bg-amber-50/30 shadow-md'
-                    : 'border-slate-200 hover:border-slate-300 hover:shadow-sm'
-                }`}
-              >
-                {plan?.badge && (
-                  <div className="absolute -top-3 left-1/2 -translate-x-1/2">
-                    <span className="bg-amber-500 text-white text-xs font-bold px-3 py-1 rounded-full whitespace-nowrap shadow">
-                      ⭐ {plan.badge}
-                    </span>
-                  </div>
-                )}
-                {isCurrent && (
-                  <div className="absolute -top-3 left-1/2 -translate-x-1/2">
-                    <span className="bg-emerald-600 text-white text-xs font-bold px-3 py-1 rounded-full whitespace-nowrap shadow">
-                      ✓ Joriy tarif
-                    </span>
-                  </div>
-                )}
-
-                <div className="mb-3">
-                  <div className="flex items-center gap-2 mb-1">
-                    {key === 'free' && <Zap className="w-4 h-4 text-slate-400" />}
-                    {key === 'basic' && <Zap className="w-4 h-4 text-blue-500" />}
-                    {key === 'pro' && <Crown className="w-4 h-4 text-amber-500" />}
-                    {isEnterprise && <Building2 className="w-4 h-4 text-purple-500" />}
-                    <h4 className="font-bold text-slate-900 text-base">{plan?.name}</h4>
-                  </div>
-                  <p className="text-xs text-slate-500 leading-snug">{plan?.tagline}</p>
-                </div>
-
-                <div className="mb-4">
-                  {plan?.price_uzs === 0 ? (
-                    <p className="text-3xl font-black text-slate-900">Bepul</p>
-                  ) : (
-                    <>
-                      <p className="text-2xl font-black text-slate-900">
-                        {plan?.price_uzs?.toLocaleString('ru-RU')}
-                        <span className="text-sm font-normal text-slate-500 ml-1">so'm/oy</span>
-                      </p>
-                      <p className="text-xs text-slate-400">≈ {plan?.price_rub?.toLocaleString('ru-RU')} ₽/oy</p>
-                    </>
-                  )}
-                </div>
-
-                <ul className="space-y-2 mb-5 flex-1">
-                  {plan?.features?.map((f: string, i: number) => (
-                    <li key={i} className="flex items-start gap-2 text-xs text-slate-700">
-                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 mt-0.5 shrink-0" />
-                      <span>{f}</span>
-                    </li>
-                  ))}
-                  {plan?.limits?.map((f: string, i: number) => (
-                    <li key={`l-${i}`} className="flex items-start gap-2 text-xs text-slate-400">
-                      <span className="w-3.5 h-3.5 mt-0.5 shrink-0 flex items-center justify-center text-slate-300 font-bold">–</span>
-                      <span>{f}</span>
-                    </li>
-                  ))}
-                </ul>
-
-                <button
-                  disabled={isCurrent}
-                  className={`w-full py-2.5 rounded-lg text-sm font-semibold transition-all ${
-                    isCurrent
-                      ? 'bg-emerald-100 text-emerald-700 cursor-default'
-                      : isPro
-                      ? 'bg-amber-500 hover:bg-amber-600 text-white shadow-sm'
-                      : isEnterprise
-                      ? 'bg-purple-600 hover:bg-purple-700 text-white'
-                      : 'bg-slate-800 hover:bg-slate-900 text-white'
-                  }`}
-                >
-                  {isCurrent ? '✓ Faol tarif' : key === 'enterprise' ? 'Bog\'lanish' : 'Tanlash'}
-                </button>
-              </div>
-            );
-          })}
-        </div>
-
-        <div className="mt-6 rounded-xl bg-gradient-to-r from-emerald-50 to-blue-50 border border-emerald-100 p-4">
-          <p className="text-sm text-slate-700 font-medium mb-1">💡 Nima uchun integratsiya kerak?</p>
-          <p className="text-xs text-slate-500 leading-relaxed">
-            Agentlar Sales Doctorga zakaz kiritadi → zakaz avtomatik MoySkladga tushadi → omborchi ko'radi → yetkazib berish chiqadi.
-            Hech qanday qo'lda ko'chirish, xato yoki vaqt yo'qotish yo'q.
-          </p>
         </div>
       </motion.div>
 

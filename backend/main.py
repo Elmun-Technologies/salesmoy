@@ -16,7 +16,7 @@ from database import init_db
 from middleware.tenant import TenantMiddleware
 from routers import (
     orders, stock, clients, debts, delivery, logs, webhooks,
-    auth, billing, agents,
+    auth, agents,
 )
 from services.moysklad import close_moysklad_client
 from services.salesdoctor import close_salesdoctor_client
@@ -240,7 +240,6 @@ app.add_middleware(TenantMiddleware)
 
 # Include routers
 app.include_router(auth.router)
-app.include_router(billing.router)
 app.include_router(orders.router)
 app.include_router(stock.router)
 app.include_router(clients.router)
@@ -265,7 +264,6 @@ async def root():
         "timestamp": datetime.utcnow().isoformat(),
         "endpoints": {
             "auth": "/api/auth",
-            "billing": "/api/billing",
             "orders": "/api/orders",
             "stock": "/api/stock",
             "clients": "/api/clients",

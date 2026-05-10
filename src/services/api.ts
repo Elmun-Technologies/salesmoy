@@ -167,22 +167,6 @@ export const unregisterMoySkladWebhooks = () =>
     () => Promise.resolve({ success: true })
   );
 
-// Billing
-export const getPlans = () =>
-  withFallback(() => fetchJson('/api/billing/plans'), () => mock.mockGetPlans());
-
-export const createPayment = (data: unknown) =>
-  withFallback(
-    () => fetchJson('/api/billing/subscribe', { method: 'POST', body: JSON.stringify(data) }),
-    () => Promise.resolve({ success: true, payment_url: '#' })
-  );
-
-export const getBillingStatus = () =>
-  withFallback(() => fetchJson('/api/billing/status'), () => mock.mockGetBillingStatus());
-
-export const getPaymentHistory = () =>
-  withFallback(() => fetchJson('/api/billing/history'), () => mock.mockGetPaymentHistory());
-
 // Orders
 export const getOrders = (params?: string) =>
   withFallback(
