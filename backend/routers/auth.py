@@ -1,5 +1,6 @@
 """Authentication, JWT, and MoySklad OAuth for marketplace deployment."""
 
+import logging
 from datetime import datetime, timedelta
 from typing import Optional
 from urllib.parse import quote
@@ -22,6 +23,8 @@ from security.jwt_tokens import (
     decode_moysklad_oauth_state_token,
 )
 from services.moysklad_oauth import MoySkladOAuth, fetch_moysklad_account_id
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -79,6 +82,43 @@ def _token_response(user: User, tenant: Tenant) -> dict:
         "access_token": access_token,
         "token_type": "bearer",
     }
+
+
+async def _auto_register_webhooks(tenant: Tenant, db: AsyncSession) -> None:
+    """Auto-register MoySklad webhooks after a tenant connects their account.
+
+    Silently skips if PUBLIC_BASE_URL is not HTTPS (dev/local environments).
+    Never raises — failures are logged but don't block the connection response.
+    """
+    from services.moysklad import MoySkladClient
+
+    cfg = get_settings()
+    base = (cfg.public_base_url or "").rstrip("/")
+    if not base or not base.startswith("https://"):
+        logger.info("Skipping auto-webhook registration: PUBLIC_BASE_URL not HTTPS (%s)", base)
+        return
+
+    target_url = f"{base}/api/webhook/moysklad"
+    client = MoySkladClient(token=tenant.moysklad_access_token)
+    try:
+        # Fetch and store accountId so webhook routing works immediately
+        if not tenant.moysklad_account_id:
+            account_id = await client.get_account_id()
+            if account_id:
+                tenant.moysklad_account_id = account_id
+                await db.commit()
+
+        result = await client.ensure_webhooks(target_url)
+        logger.info(
+            "Auto-webhooks for tenant %s: created=%s existing=%s",
+            tenant.id,
+            len(result.get("created", [])),
+            len(result.get("existing", [])),
+        )
+    except Exception as e:
+        logger.warning("Auto-webhook registration failed for tenant %s: %s", tenant.id, e)
+    finally:
+        await client.close()
 
 
 # ========== Endpoints ==========
@@ -270,6 +310,9 @@ async def moysklad_oauth_callback(
 
     await db.commit()
 
+    # Auto-register webhooks so real-time sync works immediately
+    await _auto_register_webhooks(tenant, db)
+
     return redirect(ok=True)
 
 
@@ -297,6 +340,9 @@ async def connect_moysklad(
         tenant.moysklad_account_id = data.account_id
 
     await db.commit()
+
+    # Auto-register webhooks so real-time sync works immediately
+    await _auto_register_webhooks(tenant, db)
 
     return {"success": True, "message": "MoySklad connected successfully"}
 
