@@ -14,7 +14,8 @@ from models import (
 )
 from services.moysklad import MoySkladClient
 from services.salesdoctor import SalesDoctorClient, MS_STATUS_TO_SD
-from utils.currency import convert_usd_to_uzs
+from services.exchange_rate import get_usd_to_uzs_rate
+from utils.currency import convert_usd_to_uzs_with_live_rate
 
 logger = logging.getLogger(__name__)
 
@@ -393,6 +394,10 @@ class SyncService:
         if result.scalar_one_or_none():
             return None
 
+        # Get live exchange rate once for all conversions
+        from utils.currency import convert_usd_to_uzs
+        current_rate = await get_usd_to_uzs_rate()
+
         # Parse counterparty (client)
         agent_data = ms_order.get("agent", {})
         client_name = agent_data.get("name", "")
@@ -464,7 +469,7 @@ class SyncService:
                     {
                         "product": {"code_1C": item.get("sku", "")},
                         "quantity": item.get("qty", 1),
-                        "price": convert_usd_to_uzs(item.get("price", 0)),
+                        "price": convert_usd_to_uzs(item.get("price", 0), current_rate),
                         "discountSumma": 0,
                     }
                     for item in items
@@ -762,6 +767,9 @@ class SyncService:
         if not self.sd:
             return
 
+        from utils.currency import convert_usd_to_uzs
+        current_rate = await get_usd_to_uzs_rate()
+
         agent_data = ms_order.get("agent", {})
         client_name = agent_data.get("name", order.client_name or "")
         client_phone = (agent_data.get("phone") or agent_data.get("actualPhone") or order.client_phone or "")
@@ -798,7 +806,7 @@ class SyncService:
             {
                 "product": {"code_1C": item.get("sku", "")},
                 "quantity": item.get("qty", 1),
-                "price": convert_usd_to_uzs(item.get("price", 0)),
+                "price": convert_usd_to_uzs(item.get("price", 0), current_rate),
                 "discountSumma": 0,
             }
             for item in items if item.get("sku")
@@ -1286,6 +1294,9 @@ class SyncService:
             return
 
         try:
+            from utils.currency import convert_usd_to_uzs
+            current_rate = await get_usd_to_uzs_rate()
+
             stock_rows = await self.ms.get_stock()
             synced = 0
             low_stock_items = []
@@ -1345,7 +1356,7 @@ class SyncService:
                         "SD_id": "",
                         "code_1C": sku,
                         "quantity": qty,
-                        "price": convert_usd_to_uzs(price),
+                        "price": convert_usd_to_uzs(price, current_rate),
                     })
 
                 synced += 1
