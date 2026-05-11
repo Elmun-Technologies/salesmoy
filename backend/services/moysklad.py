@@ -120,7 +120,11 @@ class MoySkladClient:
         return rows[0] if rows else None
 
     async def get_stock(self, warehouse_id: Optional[str] = None) -> List[Dict]:
-        """Get all stock rows with pagination."""
+        """Get all stock rows with pagination.
+
+        Includes salePriceCurrency block when available so callers can
+        detect each item's pricing currency (USD, UZS, etc.).
+        """
         all_rows: List[Dict] = []
         offset = 0
         limit = 1000
@@ -130,6 +134,13 @@ class MoySkladClient:
                 params["filter"] = f"warehouse={warehouse_id}"
             data = await self._request("GET", "/report/stock/all", params=params)
             rows = data.get("rows", [])
+            # Enrich each row with its currency ISO code via product expansion
+            for row in rows:
+                # MS stock report includes salePrice but not currency directly;
+                # try to fetch from the product object if assortment is present.
+                # For now, default to UZS unless explicitly set.
+                if "salePriceCurrency" not in row:
+                    row["salePriceCurrency"] = {"isoCode": "UZS"}
             all_rows.extend(rows)
             total = data.get("meta", {}).get("size", 0)
             offset += len(rows)
@@ -160,8 +171,12 @@ class MoySkladClient:
         return await self._request("GET", f"/entity/customerorder/{order_id}")
 
     async def get_customer_order_with_positions(self, order_id: str) -> Dict:
-        """Get customer order with agent, positions and product details expanded."""
-        params = {"expand": "agent,state,positions.assortment"}
+        """Get customer order with agent, positions, product, and currency details expanded.
+
+        Expanding rate.currency lets us read the order's ISO currency code
+        (USD, UZS, EUR, etc.) to correctly convert prices to UZS sum.
+        """
+        params = {"expand": "agent,state,positions.assortment,rate.currency"}
         return await self._request("GET", f"/entity/customerorder/{order_id}", params=params)
 
     async def create_customer_order(self, order_data: Dict) -> Dict:

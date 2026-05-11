@@ -394,9 +394,10 @@ class SyncService:
         if result.scalar_one_or_none():
             return None
 
-        # Get live exchange rate once for all conversions
-        from utils.currency import convert_usd_to_uzs
+        # Get live exchange rate once for all conversions in this order
+        from utils.currency import convert_moysklad_price_to_uzs, get_order_currency_iso
         current_rate = await get_usd_to_uzs_rate()
+        order_currency = get_order_currency_iso(ms_order)  # "USD", "UZS", etc.
 
         # Parse counterparty (client)
         agent_data = ms_order.get("agent", {})
@@ -404,21 +405,27 @@ class SyncService:
         client_phone = agent_data.get("phone", "") or agent_data.get("actualPhone", "")
 
         order_name = ms_order.get("name", ms_id[:8])
-        total = ms_order.get("sum", 0)  # order API returns in currency units
+        # MoySklad returns sum in kopecks; normalize to UZS using order currency
+        total_raw = ms_order.get("sum", 0)
+        total = convert_moysklad_price_to_uzs(total_raw, order_currency, current_rate)
         description = ms_order.get("description", "")
         state_name = ms_order.get("state", {}).get("name", "Новый") if isinstance(ms_order.get("state"), dict) else "Новый"
 
-        # Parse positions
+        # Parse positions — keep raw MS prices; convert when pushing to SD
         items: List[Dict] = []
         positions_block = ms_order.get("positions", {})
         if isinstance(positions_block, dict):
             for pos in positions_block.get("rows", []):
                 assortment = pos.get("assortment", {})
+                price_raw = pos.get("price", 0)  # in kopecks/cents
                 items.append({
                     "name": assortment.get("name", ""),
                     "sku": assortment.get("code", ""),
                     "qty": pos.get("quantity", 1),
-                    "price": pos.get("price", 0),  # order API returns in currency units
+                    # Store normalized UZS price for local DB / display
+                    "price": convert_moysklad_price_to_uzs(price_raw, order_currency, current_rate),
+                    "price_raw": price_raw,
+                    "currency": order_currency,
                 })
 
         status_map = {
@@ -469,7 +476,8 @@ class SyncService:
                     {
                         "product": {"code_1C": item.get("sku", "")},
                         "quantity": item.get("qty", 1),
-                        "price": convert_usd_to_uzs(item.get("price", 0), current_rate),
+                        # item["price"] is already normalized UZS (see parsing above)
+                        "price": item.get("price", 0),
                         "discountSumma": 0,
                     }
                     for item in items
@@ -767,8 +775,9 @@ class SyncService:
         if not self.sd:
             return
 
-        from utils.currency import convert_usd_to_uzs
+        from utils.currency import convert_moysklad_price_to_uzs, get_order_currency_iso
         current_rate = await get_usd_to_uzs_rate()
+        order_currency = get_order_currency_iso(ms_order)
 
         agent_data = ms_order.get("agent", {})
         client_name = agent_data.get("name", order.client_name or "")
@@ -781,10 +790,12 @@ class SyncService:
         if isinstance(positions_block, dict):
             for pos in positions_block.get("rows", []):
                 assortment = pos.get("assortment", {})
+                price_raw = pos.get("price", 0)  # MoySklad kopecks/cents
                 items.append({
                     "sku": assortment.get("code", ""),
                     "qty": pos.get("quantity", 1),
-                    "price": pos.get("price", 0),
+                    # Convert to UZS sum based on order's currency
+                    "price": convert_moysklad_price_to_uzs(price_raw, order_currency, current_rate),
                 })
 
         client_code = client_phone or client_name
@@ -806,7 +817,8 @@ class SyncService:
             {
                 "product": {"code_1C": item.get("sku", "")},
                 "quantity": item.get("qty", 1),
-                "price": convert_usd_to_uzs(item.get("price", 0), current_rate),
+                # Already normalized to UZS in items parsing above
+                "price": item.get("price", 0),
                 "discountSumma": 0,
             }
             for item in items if item.get("sku")
@@ -1294,7 +1306,7 @@ class SyncService:
             return
 
         try:
-            from utils.currency import convert_usd_to_uzs
+            from utils.currency import convert_moysklad_price_to_uzs
             current_rate = await get_usd_to_uzs_rate()
 
             stock_rows = await self.ms.get_stock()
@@ -1313,7 +1325,13 @@ class SyncService:
                     continue
                 name = row.get("name", "")
                 qty = row.get("stock", 0)
-                price = row.get("salePrice", 0)  # stock report returns in currency units
+                # MoySklad stock report returns salePrice in kopecks/cents (minor units).
+                # Detect currency from salePriceCurrency.isoCode if present, default UZS.
+                price_raw = row.get("salePrice", 0)
+                price_currency_block = row.get("salePriceCurrency") or {}
+                price_iso = (price_currency_block.get("isoCode") or "UZS").upper()
+                price_uzs = convert_moysklad_price_to_uzs(price_raw, price_iso, current_rate)
+
                 store = row.get("store", {})
                 warehouse = store.get("name", "Основной склад")
                 warehouse_id = store.get("id", "")
@@ -1332,7 +1350,7 @@ class SyncService:
 
                 if item:
                     item.qty = qty
-                    item.price = price
+                    item.price = price_uzs
                     item.name = name
                     item.warehouse = warehouse
                     item.moysklad_id = ms_id
@@ -1344,7 +1362,7 @@ class SyncService:
                         sku=sku,
                         name=name,
                         qty=qty,
-                        price=price,
+                        price=price_uzs,
                         warehouse=warehouse,
                         warehouse_id=warehouse_id,
                     )
@@ -1356,7 +1374,7 @@ class SyncService:
                         "SD_id": "",
                         "code_1C": sku,
                         "quantity": qty,
-                        "price": convert_usd_to_uzs(price, current_rate),
+                        "price": price_uzs,
                     })
 
                 synced += 1
