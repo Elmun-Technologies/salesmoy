@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     debt_sync_interval: int = 600
     client_sync_interval: int = 300
 
+    # Currency exchange rate (USD to UZS)
+    # MoySklad prices are in USD, Sales Doctor expects UZS
+    usd_to_uzs_rate: float = 12695  # Example: 1 USD = 12,695 UZS
+
     # Webhook
     webhook_secret: str = ""
     webhook_url: str = ""

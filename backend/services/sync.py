@@ -14,6 +14,7 @@ from models import (
 )
 from services.moysklad import MoySkladClient
 from services.salesdoctor import SalesDoctorClient, MS_STATUS_TO_SD
+from utils.currency import convert_usd_to_uzs
 
 logger = logging.getLogger(__name__)
 
@@ -463,7 +464,7 @@ class SyncService:
                     {
                         "product": {"code_1C": item.get("sku", "")},
                         "quantity": item.get("qty", 1),
-                        "price": item.get("price", 0),
+                        "price": convert_usd_to_uzs(item.get("price", 0)),
                         "discountSumma": 0,
                     }
                     for item in items
@@ -797,7 +798,7 @@ class SyncService:
             {
                 "product": {"code_1C": item.get("sku", "")},
                 "quantity": item.get("qty", 1),
-                "price": item.get("price", 0),
+                "price": convert_usd_to_uzs(item.get("price", 0)),
                 "discountSumma": 0,
             }
             for item in items if item.get("sku")
@@ -1344,6 +1345,7 @@ class SyncService:
                         "SD_id": "",
                         "code_1C": sku,
                         "quantity": qty,
+                        "price": convert_usd_to_uzs(price),
                     })
 
                 synced += 1
