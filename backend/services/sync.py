@@ -1109,7 +1109,7 @@ class SyncService:
             current_rate = await get_usd_to_uzs_rate()
 
             sd_products = []
-            sd_product_prices = []  # (code_1C, price_uzs) for setProductPrice
+            sd_product_prices = []  # (code_1C, price_uzs) for setPrice
             for p in ms_products:
                 code = p.get("code", "")
                 name = p.get("name", "")
@@ -1127,6 +1127,7 @@ class SyncService:
                         iso = (currency_block.get("isoCode") or "UZS").upper()
                         price_uzs = convert_moysklad_price_to_uzs(raw_value, iso, current_rate)
 
+                # setProduct payload (no price field — per SD API spec)
                 prod: Dict = {
                     "CS_id": "",
                     "SD_id": "",
@@ -1142,17 +1143,11 @@ class SyncService:
                 }
                 if sd_unit:
                     prod["unit"] = sd_unit
-                # Embed price so agents see it when creating an order in SD
-                if price_uzs > 0:
-                    prod["price"] = price_uzs
-                    prod["productPrice"] = [{
-                        "priceType": {"code_1C": "retail"},
-                        "price": price_uzs,
-                    }]
-                    sd_product_prices.append((code, price_uzs))
                 sd_products.append(prod)
+                if price_uzs > 0:
+                    sd_product_prices.append((code, price_uzs))
 
-            # Send products in batches of 100
+            # 1) Push products (without price) — matches SD setProduct schema
             batch_size = 100
             for i in range(0, len(sd_products), batch_size):
                 batch = sd_products[i:i + batch_size]
@@ -1161,31 +1156,46 @@ class SyncService:
                 except Exception as e:
                     logger.warning("setProduct batch %d failed: %s", i // batch_size, e)
 
-            # Best-effort: also push prices via setProductPrice if SD has that endpoint.
-            # Some SD instances need a separate call; if endpoint is missing we just skip.
+            # 2) Push prices via SD's dedicated setPrice endpoint (Касса → Цены).
+            #    Format per Sales Doctor Public API 2:
+            #    {
+            #      "method": "setPrice",
+            #      "data": {"product": [{
+            #         "code_1C": "<SKU>",
+            #         "document_1C": "<batch-id>",
+            #         "priceType": {"code_1C": "retail", "price": "12345.00"}
+            #      }]}
+            #    }
+            priced = 0
             if sd_product_prices:
-                try:
-                    payload = [
-                        {
+                # Single batch identifier so all rows attach to one logical import
+                doc_id = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                payload_all = [
+                    {
+                        "CS_id": "",
+                        "SD_id": "",
+                        "code_1C": code,
+                        "document_1C": doc_id,
+                        "priceType": {
                             "CS_id": "",
                             "SD_id": "",
-                            "product": {"code_1C": code},
-                            "priceType": {"code_1C": "retail"},
-                            "price": price,
-                        }
-                        for code, price in sd_product_prices
-                    ]
-                    for i in range(0, len(payload), batch_size):
-                        try:
-                            await self.sd._rpc("setProductPrice", {"productPrice": payload[i:i + batch_size]})
-                        except Exception as e:
-                            logger.warning("setProductPrice batch %d failed: %s", i // batch_size, e)
-                            break  # endpoint likely unsupported — stop trying
-                except Exception as e:
-                    logger.warning("Product price push skipped: %s", e)
+                            "code_1C": "retail",
+                            "price": f"{price:.2f}",
+                        },
+                    }
+                    for code, price in sd_product_prices
+                ]
+                for i in range(0, len(payload_all), batch_size):
+                    chunk = payload_all[i:i + batch_size]
+                    try:
+                        await self.sd._rpc("setPrice", {"product": chunk})
+                        priced += len(chunk)
+                    except Exception as e:
+                        logger.warning("setPrice batch %d failed: %s", i // batch_size, e)
 
             await self.log(LogType.INFO, "Product Sync",
-                           f"Synced {len(sd_products)} products ({len(sd_product_prices)} with price) to Sales Doctor")
+                           f"Synced {len(sd_products)} products to Sales Doctor "
+                           f"({priced}/{len(sd_product_prices)} prices via setPrice)")
 
         except Exception as e:
             logger.warning("sync_products_to_salesdoctor failed: %s", e)
