@@ -40,6 +40,11 @@ class SyncService:
     # Cached SD order defaults (priceType, warehouse) per tenant
     _sd_order_defaults: Dict[int, Dict[str, Dict[str, str]]] = {}
 
+    # Cached SD "retail" priceType reference per tenant (SD_id + code_1C)
+    # Resolved from the actual SD instance so setPrice attaches to the same
+    # priceType the agent sees in the order ("Розничная").
+    _sd_retail_price_type: Dict[int, Dict[str, str]] = {}
+
     def __init__(self, db: AsyncSession, tenant: Tenant):
         self.db = db
         self.tenant = tenant
@@ -1157,41 +1162,41 @@ class SyncService:
                     logger.warning("setProduct batch %d failed: %s", i // batch_size, e)
 
             # 2) Push prices via SD's dedicated setPrice endpoint (Касса → Цены).
-            #    Format per Sales Doctor Public API 2:
-            #    {
-            #      "method": "setPrice",
-            #      "data": {"product": [{
-            #         "code_1C": "<SKU>",
-            #         "document_1C": "<batch-id>",
-            #         "priceType": {"code_1C": "retail", "price": "12345.00"}
-            #      }]}
-            #    }
+            #    Crucial: attach to the EXACT priceType the agent uses in the
+            #    order UI (usually "Розничная"). Resolve its SD_id/code_1C
+            #    once per tenant, then embed that ref in every setPrice row.
             priced = 0
             if sd_product_prices:
-                # Single batch identifier so all rows attach to one logical import
-                doc_id = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-                payload_all = [
-                    {
-                        "CS_id": "",
-                        "SD_id": "",
-                        "code_1C": code,
-                        "document_1C": doc_id,
-                        "priceType": {
+                price_type_ref = await self._get_sd_retail_price_type()
+                if not price_type_ref:
+                    logger.warning(
+                        "No SD priceType resolved — skipping setPrice (would attach prices to nothing)"
+                    )
+                else:
+                    doc_id = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                    payload_all = []
+                    for code, price in sd_product_prices:
+                        # Build per-row priceType: copy ref and add the price field
+                        pt_block: Dict = {
+                            "CS_id": price_type_ref.get("CS_id", ""),
+                            "SD_id": price_type_ref.get("SD_id", ""),
+                            "code_1C": price_type_ref.get("code_1C", ""),
+                            "price": f"{price:.2f}",
+                        }
+                        payload_all.append({
                             "CS_id": "",
                             "SD_id": "",
-                            "code_1C": "retail",
-                            "price": f"{price:.2f}",
-                        },
-                    }
-                    for code, price in sd_product_prices
-                ]
-                for i in range(0, len(payload_all), batch_size):
-                    chunk = payload_all[i:i + batch_size]
-                    try:
-                        await self.sd._rpc("setPrice", {"product": chunk})
-                        priced += len(chunk)
-                    except Exception as e:
-                        logger.warning("setPrice batch %d failed: %s", i // batch_size, e)
+                            "code_1C": code,
+                            "document_1C": doc_id,
+                            "priceType": pt_block,
+                        })
+                    for i in range(0, len(payload_all), batch_size):
+                        chunk = payload_all[i:i + batch_size]
+                        try:
+                            await self.sd._rpc("setPrice", {"product": chunk})
+                            priced += len(chunk)
+                        except Exception as e:
+                            logger.warning("setPrice batch %d failed: %s", i // batch_size, e)
 
             await self.log(LogType.INFO, "Product Sync",
                            f"Synced {len(sd_products)} products to Sales Doctor "
@@ -1331,6 +1336,49 @@ class SyncService:
         except Exception as e:
             logger.warning("SD getAgent failed: %s", e)
             return None
+
+    async def _get_sd_retail_price_type(self) -> Dict[str, str]:
+        """Return a reference {SD_id, code_1C} to SD's active retail priceType.
+
+        Strategy:
+          1. Fetch all priceTypes from SD.
+          2. Prefer one whose name contains "роз" or "retail".
+          3. Otherwise pick the first one.
+          4. Return BOTH SD_id and code_1C so callers can include whichever
+             SD's setPrice accepts.
+
+        Result is cached per tenant — only fetched once per worker lifetime.
+        """
+        cached = SyncService._sd_retail_price_type.get(self.tenant.id)
+        if cached is not None:
+            return cached
+        ref: Dict[str, str] = {}
+        if not self.sd:
+            return ref
+        try:
+            result = await self.sd._rpc("getPriceType", {})
+            price_types = result.get("priceType", []) if isinstance(result, dict) else []
+            chosen = None
+            for pt in price_types:
+                if not isinstance(pt, dict):
+                    continue
+                name = (pt.get("name") or "").lower()
+                if "роз" in name or "retail" in name:
+                    chosen = pt
+                    break
+            if not chosen and price_types:
+                chosen = price_types[0]
+            if chosen:
+                if chosen.get("SD_id"):
+                    ref["SD_id"] = str(chosen["SD_id"])
+                if chosen.get("code_1C"):
+                    ref["code_1C"] = chosen["code_1C"]
+                if chosen.get("CS_id"):
+                    ref["CS_id"] = str(chosen["CS_id"])
+        except Exception as e:
+            logger.warning("SD getPriceType lookup failed: %s", e)
+        SyncService._sd_retail_price_type[self.tenant.id] = ref
+        return ref
 
     async def _load_sd_agents_index(self) -> Dict[str, Dict[str, str]]:
         """Build and cache an index of SD agents by lowercased name.
