@@ -1710,17 +1710,42 @@ class SyncService:
 
             await self.db.commit()
 
-            # Batched calls to SD with delay to avoid 429 rate limit
+            # Batched calls to SD with delay to avoid 429 rate limit.
+            # 1333 balances at batch=100 + 2s pause was still hitting SD's limits;
+            # use smaller batches + longer cooldown, with adaptive backoff on 429.
             if self.sd and sd_balances:
-                batch_size = 100
-                for i in range(0, len(sd_balances), batch_size):
+                batch_size = 50
+                base_pause = 4  # seconds between successful batches
+                backoff = base_pause
+                i = 0
+                total = len(sd_balances)
+                while i < total:
+                    chunk = sd_balances[i:i + batch_size]
                     try:
-                        await self.sd.set_current_balance(sd_balances[i:i + batch_size])
-                        if i + batch_size < len(sd_balances):
-                            await asyncio.sleep(2)  # 2s pause between batches → no 429
+                        await self.sd.set_current_balance(chunk)
+                        i += batch_size
+                        backoff = base_pause  # reset on success
+                        if i < total:
+                            await asyncio.sleep(base_pause)
                     except Exception as e:
-                        logger.warning("SalesDoctor balance sync failed (batch %d): %s", i // batch_size + 1, e)
-                        await asyncio.sleep(5)  # longer pause after error
+                        msg = str(e)
+                        is_rate_limited = "429" in msg or "Too Many" in msg
+                        if is_rate_limited:
+                            # Exponential backoff capped at 60s, then retry SAME chunk
+                            backoff = min(backoff * 2, 60)
+                            logger.warning(
+                                "SD 429 on balance batch starting at %d — sleeping %ds before retry",
+                                i, backoff,
+                            )
+                            await asyncio.sleep(backoff)
+                            # do NOT advance i — retry the same chunk
+                        else:
+                            logger.warning(
+                                "SalesDoctor balance sync failed (batch starting %d): %s", i, e
+                            )
+                            # Non-429 error: skip this batch to avoid infinite loop
+                            i += batch_size
+                            await asyncio.sleep(base_pause)
 
             await self.log(LogType.SUCCESS, "Debt Sync", f"Synced debts for {synced} clients")
 
