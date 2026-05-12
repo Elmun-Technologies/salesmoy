@@ -418,8 +418,15 @@ class SyncService:
 
         # Get live exchange rate once for all conversions in this order
         from utils.currency import convert_moysklad_price_to_uzs, get_order_currency_iso
+        import os
         current_rate = await get_usd_to_uzs_rate()
-        order_currency = get_order_currency_iso(ms_order)  # "USD", "UZS", etc.
+        # Force-currency policy: tenant catalog is priced in $, so even orders
+        # whose MoySklad rate.currency says UZS should be converted as USD.
+        force_currency = (
+            SyncService._default_price_currency.get(self.tenant.id)
+            or os.getenv("FORCE_PRICE_CURRENCY", "USD")
+        ).upper()
+        order_currency = force_currency  # was: get_order_currency_iso(ms_order)
 
         # Parse counterparty (client) — note: MoySklad calls this "agent" (контрагент)
         agent_data = ms_order.get("agent", {})
@@ -822,8 +829,13 @@ class SyncService:
             return
 
         from utils.currency import convert_moysklad_price_to_uzs, get_order_currency_iso
+        import os
         current_rate = await get_usd_to_uzs_rate()
-        order_currency = get_order_currency_iso(ms_order)
+        force_currency = (
+            SyncService._default_price_currency.get(self.tenant.id)
+            or os.getenv("FORCE_PRICE_CURRENCY", "USD")
+        ).upper()
+        order_currency = force_currency  # tenant catalog is $ — force USD
 
         agent_data = ms_order.get("agent", {})
         client_name = agent_data.get("name", order.client_name or "")
@@ -1122,12 +1134,17 @@ class SyncService:
             from utils.currency import convert_moysklad_price_to_uzs, detect_currency_iso
             current_rate = await get_usd_to_uzs_rate()
 
-            # Per-tenant default currency for products with no detectable currency.
-            # If most prices look foreign-sized (< 10000 minor units = < 100 main),
-            # assume USD; otherwise UZS.
-            default_currency = SyncService._default_price_currency.get(
-                self.tenant.id, "USD"
-            )
+            # Currency policy:
+            #   FORCE_PRICE_CURRENCY="USD" → every product price treated as USD
+            #   (MoySklad isoCode is IGNORED). This matches tenants whose
+            #   catalogs use $ semantics regardless of the MoySklad currency
+            #   field. Default is "USD" because this is the current customer's
+            #   setup — override per tenant via _default_price_currency or env.
+            import os
+            force_currency = (
+                SyncService._default_price_currency.get(self.tenant.id)
+                or os.getenv("FORCE_PRICE_CURRENCY", "USD")
+            ).upper()
             currency_cache: Dict[str, str] = {}
 
             sd_products = []
@@ -1137,19 +1154,15 @@ class SyncService:
                 name = p.get("name", "")
                 if not code or not name:
                     continue
-                # Extract sale price + currency from MoySklad product
+                # Extract sale price from MoySklad product. Currency is forced
+                # per tenant policy above — do NOT trust MoySklad's isoCode.
                 price_uzs = 0
-                product_currency = default_currency
+                product_currency = force_currency
                 sale_prices = p.get("salePrices") or []
                 if isinstance(sale_prices, list) and sale_prices:
-                    # Pick the first sale price (usually "Цена продажи" / retail)
                     sp = sale_prices[0]
                     if isinstance(sp, dict):
                         raw_value = sp.get("value", 0)
-                        currency_block = sp.get("currency") or {}
-                        product_currency = detect_currency_iso(
-                            currency_block, default=default_currency
-                        )
                         price_uzs = convert_moysklad_price_to_uzs(
                             raw_value, product_currency, current_rate
                         )
@@ -1603,9 +1616,11 @@ class SyncService:
                     logger.warning("Early product sync for currency map failed: %s", e)
                 product_currencies = SyncService._product_currencies.get(self.tenant.id) or {}
 
-            default_currency = SyncService._default_price_currency.get(
-                self.tenant.id, "USD"
-            )
+            import os
+            force_currency = (
+                SyncService._default_price_currency.get(self.tenant.id)
+                or os.getenv("FORCE_PRICE_CURRENCY", "USD")
+            ).upper()
 
             stock_rows = await self.ms.get_stock()
             synced = 0
@@ -1623,12 +1638,12 @@ class SyncService:
                     continue
                 name = row.get("name", "")
                 qty = row.get("stock", 0)
-                # MoySklad stock report returns salePrice in minor units (kopecks/cents).
-                # Currency is NOT in the report — look it up from the product cache,
-                # fall back to tenant default (usually USD for this tenant's catalog).
+                # MoySklad stock report returns salePrice in minor units.
+                # We FORCE the configured currency (default USD) — MoySklad's
+                # isoCode is ignored because this tenant's catalog is priced
+                # in $ regardless of how MoySklad stores it.
                 price_raw = row.get("salePrice", 0)
-                price_iso = product_currencies.get(sku) or default_currency
-                price_uzs = convert_moysklad_price_to_uzs(price_raw, price_iso, current_rate)
+                price_uzs = convert_moysklad_price_to_uzs(price_raw, force_currency, current_rate)
 
                 store = row.get("store", {})
                 warehouse = store.get("name", "Основной склад")
