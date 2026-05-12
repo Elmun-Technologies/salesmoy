@@ -91,13 +91,17 @@ class SalesDoctorClient:
                         fail_error = first_fail.get("error") or first_fail.get("message") or detail_msg
                         fail_code = first_fail.get("code_1C") or first_fail.get("SD_id") or "?"
                         detail_msg = f"{fail_error} (code_1C={fail_code})"
-                # Include raw response snippet for generic "FAILED" messages
-                if detail_msg in ("FAILED", "Unknown error", ""):
-                    raw_snippet = str(result)[:300]
+                # Include raw response snippet for generic messages so we can
+                # actually see what SD is complaining about.
+                if detail_msg in ("FAILED", "Unknown error", "Error", ""):
+                    raw_snippet = str(result)[:500]
                     detail_msg = f"SD returned error for [{method}]: {raw_snippet}"
                 if completed == 0:
                     raise SalesDoctorError(detail_msg)
-                logger.warning("SD partial error in %s: %s", method, detail_msg)
+                logger.warning(
+                    "SD partial error in %s (completed=%s, failed=%s): %s",
+                    method, completed, len(failed_items), detail_msg,
+                )
             return result.get("result", result) if isinstance(result, dict) else result
         except httpx.HTTPStatusError as e:
             logger.error("SalesDoctor HTTP %s: %s", e.response.status_code, e.response.text)
