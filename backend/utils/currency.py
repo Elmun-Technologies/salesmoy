@@ -72,20 +72,38 @@ def convert_moysklad_price_to_uzs(
     return int(round(price_uzs))
 
 
+def detect_currency_iso(currency_block: dict, default: str = "UZS") -> str:
+    """Best-effort ISO currency code extraction from a MoySklad currency object.
+
+    Tries (in order): isoCode → code → name keywords → default.
+    """
+    if not isinstance(currency_block, dict):
+        return default
+    iso = (currency_block.get("isoCode") or "").strip()
+    if iso:
+        return iso.upper()
+    code = (currency_block.get("code") or "").strip()
+    if code:
+        return code.upper()
+    name = (currency_block.get("name") or "").lower()
+    if "доллар" in name or "dollar" in name or "usd" in name or "$" in name:
+        return "USD"
+    if "евро" in name or "euro" in name or "eur" in name or "€" in name:
+        return "EUR"
+    if "рубл" in name or "ruble" in name or "rub" in name or "₽" in name:
+        return "RUB"
+    if "сум" in name or "uzs" in name or "soum" in name:
+        return "UZS"
+    return default
+
+
 def get_order_currency_iso(ms_order: dict) -> str:
     """Extract ISO currency code from a MoySklad customerorder.
 
-    MoySklad's order has rate.currency.meta but ISO code is only present
-    when `rate.currency` is expanded. Falls back to UZS if missing.
+    Reads rate.currency (must be expanded). Falls back to UZS if not detectable.
     """
     rate_block = ms_order.get("rate") or {}
-    currency = rate_block.get("currency") or {}
-    # When expanded, currency has isoCode directly
-    iso = currency.get("isoCode")
-    if iso:
-        return iso.upper()
-    # Fallback — assume UZS
-    return "UZS"
+    return detect_currency_iso(rate_block.get("currency") or {}, default="UZS")
 
 
 async def convert_usd_to_uzs_with_live_rate(price_usd: float) -> int:

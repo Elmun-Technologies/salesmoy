@@ -45,6 +45,15 @@ class SyncService:
     # priceType the agent sees in the order ("Розничная").
     _sd_retail_price_type: Dict[int, Dict[str, str]] = {}
 
+    # Map of MoySklad product code → currency ISO ("USD", "UZS", ...)
+    # Built during product sync. Used by stock sync (whose API doesn't
+    # expand currency) to apply the correct conversion.
+    _product_currencies: Dict[int, Dict[str, str]] = {}
+
+    # Default currency to assume when MoySklad data doesn't expose it.
+    # Set this to "USD" for tenants whose MoySklad catalog is priced in $.
+    _default_price_currency: Dict[int, str] = {}
+
     def __init__(self, db: AsyncSession, tenant: Tenant):
         self.db = db
         self.tenant = tenant
@@ -1110,8 +1119,16 @@ class SyncService:
                 pass
 
             # Live exchange rate for any USD-priced products
-            from utils.currency import convert_moysklad_price_to_uzs
+            from utils.currency import convert_moysklad_price_to_uzs, detect_currency_iso
             current_rate = await get_usd_to_uzs_rate()
+
+            # Per-tenant default currency for products with no detectable currency.
+            # If most prices look foreign-sized (< 10000 minor units = < 100 main),
+            # assume USD; otherwise UZS.
+            default_currency = SyncService._default_price_currency.get(
+                self.tenant.id, "USD"
+            )
+            currency_cache: Dict[str, str] = {}
 
             sd_products = []
             sd_product_prices = []  # (code_1C, price_uzs) for setPrice
@@ -1122,6 +1139,7 @@ class SyncService:
                     continue
                 # Extract sale price + currency from MoySklad product
                 price_uzs = 0
+                product_currency = default_currency
                 sale_prices = p.get("salePrices") or []
                 if isinstance(sale_prices, list) and sale_prices:
                     # Pick the first sale price (usually "Цена продажи" / retail)
@@ -1129,8 +1147,15 @@ class SyncService:
                     if isinstance(sp, dict):
                         raw_value = sp.get("value", 0)
                         currency_block = sp.get("currency") or {}
-                        iso = (currency_block.get("isoCode") or "UZS").upper()
-                        price_uzs = convert_moysklad_price_to_uzs(raw_value, iso, current_rate)
+                        product_currency = detect_currency_iso(
+                            currency_block, default=default_currency
+                        )
+                        price_uzs = convert_moysklad_price_to_uzs(
+                            raw_value, product_currency, current_rate
+                        )
+                # Remember this product's currency so stock sync can reuse it
+                if code:
+                    currency_cache[code] = product_currency
 
                 # setProduct payload (no price field — per SD API spec)
                 prod: Dict = {
@@ -1151,6 +1176,10 @@ class SyncService:
                 sd_products.append(prod)
                 if price_uzs > 0:
                     sd_product_prices.append((code, price_uzs))
+
+            # Publish currency cache so sync_stock can convert correctly
+            if currency_cache:
+                SyncService._product_currencies[self.tenant.id] = currency_cache
 
             # 1) Push products (without price) — matches SD setProduct schema
             batch_size = 100
@@ -1559,8 +1588,24 @@ class SyncService:
             return
 
         try:
-            from utils.currency import convert_moysklad_price_to_uzs
+            from utils.currency import convert_moysklad_price_to_uzs, detect_currency_iso
             current_rate = await get_usd_to_uzs_rate()
+
+            # Ensure product → currency map is populated. The stock report doesn't
+            # carry currency info, so we lean on the product sync's cache.
+            product_currencies = SyncService._product_currencies.get(self.tenant.id) or {}
+            if not product_currencies:
+                # Trigger an early product sync so we know currencies before
+                # converting stock prices. Throttle still applies inside.
+                try:
+                    await self.sync_products_to_salesdoctor()
+                except Exception as e:
+                    logger.warning("Early product sync for currency map failed: %s", e)
+                product_currencies = SyncService._product_currencies.get(self.tenant.id) or {}
+
+            default_currency = SyncService._default_price_currency.get(
+                self.tenant.id, "USD"
+            )
 
             stock_rows = await self.ms.get_stock()
             synced = 0
@@ -1578,11 +1623,11 @@ class SyncService:
                     continue
                 name = row.get("name", "")
                 qty = row.get("stock", 0)
-                # MoySklad stock report returns salePrice in kopecks/cents (minor units).
-                # Detect currency from salePriceCurrency.isoCode if present, default UZS.
+                # MoySklad stock report returns salePrice in minor units (kopecks/cents).
+                # Currency is NOT in the report — look it up from the product cache,
+                # fall back to tenant default (usually USD for this tenant's catalog).
                 price_raw = row.get("salePrice", 0)
-                price_currency_block = row.get("salePriceCurrency") or {}
-                price_iso = (price_currency_block.get("isoCode") or "UZS").upper()
+                price_iso = product_currencies.get(sku) or default_currency
                 price_uzs = convert_moysklad_price_to_uzs(price_raw, price_iso, current_rate)
 
                 store = row.get("store", {})
