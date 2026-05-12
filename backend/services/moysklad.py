@@ -71,9 +71,13 @@ class MoySkladClient:
     async def get_counterparties(
         self, phone: Optional[str] = None, days_back: Optional[int] = None
     ) -> List[Dict]:
-        """Get counterparties, optionally filtered by phone or recently updated."""
+        """Get counterparties (clients), optionally filtered by phone or recently updated.
+
+        Expands `owner` (assigned MoySklad employee/agent) so callers can bind each
+        Sales Doctor client to the correct agent, and route delivery/orders by agent.
+        """
         from datetime import datetime, timedelta
-        params: Dict[str, Any] = {"limit": 100}
+        params: Dict[str, Any] = {"limit": 100, "expand": "owner"}
         filters = []
         if phone:
             filters.append(f"phone={phone}")
@@ -107,8 +111,16 @@ class MoySkladClient:
     # ========== Products (Stock) ==========
 
     async def get_products(self, limit: int = 100, offset: int = 0) -> List[Dict]:
-        """Get all products."""
-        params = {"limit": limit, "offset": offset}
+        """Get all products with sale prices expanded.
+
+        Including salePrices.currency lets the SD product sync attach a price
+        to every product, so agents see the price when creating an order.
+        """
+        params = {
+            "limit": limit,
+            "offset": offset,
+            "expand": "salePrices.currency",
+        }
         data = await self._request("GET", "/entity/product", params=params)
         return data.get("rows", [])
 

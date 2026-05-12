@@ -33,6 +33,10 @@ class SyncService:
     # Cached SD default agent per tenant {tenant_id: {"code_1C": ..., "SD_id": ...}}
     _sd_default_agent: Dict[int, Dict[str, str]] = {}
 
+    # Cached SD agents indexed by lowercase name {tenant_id: {agent_name_lc: {SD_id, code_1C}}}
+    # Used to bind each MoySklad client to its real assigned agent.
+    _sd_agents_by_name: Dict[int, Dict[str, Dict[str, str]]] = {}
+
     # Cached SD order defaults (priceType, warehouse) per tenant
     _sd_order_defaults: Dict[int, Dict[str, Dict[str, str]]] = {}
 
@@ -246,12 +250,16 @@ class SyncService:
                         cp_phone = cp.get("phone", "").strip()
                         if not cp_name:
                             continue
+                        # Bind each client to its MoySklad owner (assigned agent)
+                        owner = cp.get("owner")
+                        agent_ref = await self._resolve_agent_for_ms_owner(owner)
                         sd_clients_batch.append(self._build_sd_client(
                             name=cp_name,
                             phone=cp_phone,
                             address=cp.get("actualAddress", ""),
                             client_type="retail",
                             category=category,
+                            agent=agent_ref,
                         ))
                     batch_size = 100
                     failed = 0
@@ -399,10 +407,18 @@ class SyncService:
         current_rate = await get_usd_to_uzs_rate()
         order_currency = get_order_currency_iso(ms_order)  # "USD", "UZS", etc.
 
-        # Parse counterparty (client)
+        # Parse counterparty (client) — note: MoySklad calls this "agent" (контрагент)
         agent_data = ms_order.get("agent", {})
         client_name = agent_data.get("name", "")
         client_phone = agent_data.get("phone", "") or agent_data.get("actualPhone", "")
+        # Owner = the MoySklad employee (sales agent) assigned to this client.
+        # Used to bind both client and order to the correct SD agent.
+        client_owner = agent_data.get("owner") if isinstance(agent_data, dict) else None
+        # Delivery address: prefer order's shipmentAddress, fall back to client's actual address
+        delivery_address = (
+            ms_order.get("shipmentAddress")
+            or ms_order.get("shipmentAddressFull", {}).get("comment", "") if isinstance(ms_order.get("shipmentAddressFull"), dict) else ""
+        ) or agent_data.get("actualAddress", "") or ""
 
         order_name = ms_order.get("name", ms_id[:8])
         # MoySklad returns sum in kopecks; normalize to UZS using order currency
@@ -456,7 +472,12 @@ class SyncService:
         # Push to Sales Doctor via setOrder (using exact SD API field names)
         if self.sd:
             try:
-                # Ensure client exists in SD before pushing order
+                # Resolve which SD agent owns this client (based on MS owner field)
+                agent_ref = await self._resolve_agent_for_ms_owner(client_owner)
+                # Pull GPS from MoySklad client's custom attributes if available
+                client_lat_lon = self._extract_gps_from_ms_counterparty(agent_data)
+
+                # Ensure client exists in SD before pushing order, with address + GPS + agent
                 client_code = client_phone or client_name
                 if client_code:
                     try:
@@ -464,9 +485,11 @@ class SyncService:
                         sd_client = self._build_sd_client(
                             name=client_name or client_code,
                             phone=client_phone,
-                            address="",
+                            address=delivery_address,
                             client_type="retail",
                             category=category,
+                            location=client_lat_lon,
+                            agent=agent_ref,
                         )
                         await self.sd.set_client([sd_client])
                     except Exception as e:
@@ -483,16 +506,25 @@ class SyncService:
                     for item in items
                     if item.get("sku")
                 ]
+                # Pre-pend delivery address to comment so courier sees it in SD
+                comment_parts = []
+                if delivery_address:
+                    comment_parts.append(f"Манзил: {delivery_address}")
+                if description:
+                    comment_parts.append(description)
+                full_comment = " | ".join(comment_parts)
+
                 sd_order = {
                     "CS_id": "",
                     "SD_id": "",
                     "code_1C": order_name,
-                    "comment": description,
+                    "comment": full_comment,
                     "status": MS_STATUS_TO_SD.get(state_name, 1),
                     "client": {"code_1C": client_code},
                     "orderProducts": order_products,
                 }
-                agent_ref = await self._get_sd_default_agent()
+                if delivery_address:
+                    sd_order["address"] = delivery_address
                 if agent_ref:
                     sd_order["agent"] = agent_ref
                 order_defaults = await self._get_sd_order_defaults()
@@ -782,8 +814,16 @@ class SyncService:
         agent_data = ms_order.get("agent", {})
         client_name = agent_data.get("name", order.client_name or "")
         client_phone = (agent_data.get("phone") or agent_data.get("actualPhone") or order.client_phone or "")
+        client_owner = agent_data.get("owner") if isinstance(agent_data, dict) else None
         state_name = ms_order.get("state", {}).get("name", "Новый") if isinstance(ms_order.get("state"), dict) else "Новый"
         description = ms_order.get("description", order.comment or "")
+        delivery_address = (
+            ms_order.get("shipmentAddress")
+            or agent_data.get("actualAddress", "")
+            or ""
+        )
+        client_lat_lon = self._extract_gps_from_ms_counterparty(agent_data)
+        agent_ref = await self._resolve_agent_for_ms_owner(client_owner)
 
         items: List[Dict] = []
         positions_block = ms_order.get("positions", {})
@@ -805,9 +845,11 @@ class SyncService:
                 sd_client = self._build_sd_client(
                     name=client_name or client_code,
                     phone=client_phone,
-                    address="",
+                    address=delivery_address,
                     client_type="retail",
                     category=category,
+                    location=client_lat_lon,
+                    agent=agent_ref,
                 )
                 await self.sd.set_client([sd_client])
             except Exception as e:
@@ -823,15 +865,23 @@ class SyncService:
             }
             for item in items if item.get("sku")
         ]
+        comment_parts = []
+        if delivery_address:
+            comment_parts.append(f"Манзил: {delivery_address}")
+        if description:
+            comment_parts.append(description)
+        full_comment = " | ".join(comment_parts)
+
         sd_order = {
             "CS_id": "", "SD_id": "",
             "code_1C": order.order_id,
-            "comment": description,
+            "comment": full_comment,
             "status": MS_STATUS_TO_SD.get(state_name, 1),
             "client": {"code_1C": client_code},
             "orderProducts": order_products,
         }
-        agent_ref = await self._get_sd_default_agent()
+        if delivery_address:
+            sd_order["address"] = delivery_address
         if agent_ref:
             sd_order["agent"] = agent_ref
         order_defaults = await self._get_sd_order_defaults()
@@ -1054,12 +1104,29 @@ class SyncService:
             except Exception:
                 pass
 
+            # Live exchange rate for any USD-priced products
+            from utils.currency import convert_moysklad_price_to_uzs
+            current_rate = await get_usd_to_uzs_rate()
+
             sd_products = []
+            sd_product_prices = []  # (code_1C, price_uzs) for setProductPrice
             for p in ms_products:
                 code = p.get("code", "")
                 name = p.get("name", "")
                 if not code or not name:
                     continue
+                # Extract sale price + currency from MoySklad product
+                price_uzs = 0
+                sale_prices = p.get("salePrices") or []
+                if isinstance(sale_prices, list) and sale_prices:
+                    # Pick the first sale price (usually "Цена продажи" / retail)
+                    sp = sale_prices[0]
+                    if isinstance(sp, dict):
+                        raw_value = sp.get("value", 0)
+                        currency_block = sp.get("currency") or {}
+                        iso = (currency_block.get("isoCode") or "UZS").upper()
+                        price_uzs = convert_moysklad_price_to_uzs(raw_value, iso, current_rate)
+
                 prod: Dict = {
                     "CS_id": "",
                     "SD_id": "",
@@ -1075,9 +1142,17 @@ class SyncService:
                 }
                 if sd_unit:
                     prod["unit"] = sd_unit
+                # Embed price so agents see it when creating an order in SD
+                if price_uzs > 0:
+                    prod["price"] = price_uzs
+                    prod["productPrice"] = [{
+                        "priceType": {"code_1C": "retail"},
+                        "price": price_uzs,
+                    }]
+                    sd_product_prices.append((code, price_uzs))
                 sd_products.append(prod)
 
-            # Send in batches of 100
+            # Send products in batches of 100
             batch_size = 100
             for i in range(0, len(sd_products), batch_size):
                 batch = sd_products[i:i + batch_size]
@@ -1086,7 +1161,31 @@ class SyncService:
                 except Exception as e:
                     logger.warning("setProduct batch %d failed: %s", i // batch_size, e)
 
-            await self.log(LogType.INFO, "Product Sync", f"Synced {len(sd_products)} products to Sales Doctor")
+            # Best-effort: also push prices via setProductPrice if SD has that endpoint.
+            # Some SD instances need a separate call; if endpoint is missing we just skip.
+            if sd_product_prices:
+                try:
+                    payload = [
+                        {
+                            "CS_id": "",
+                            "SD_id": "",
+                            "product": {"code_1C": code},
+                            "priceType": {"code_1C": "retail"},
+                            "price": price,
+                        }
+                        for code, price in sd_product_prices
+                    ]
+                    for i in range(0, len(payload), batch_size):
+                        try:
+                            await self.sd._rpc("setProductPrice", {"productPrice": payload[i:i + batch_size]})
+                        except Exception as e:
+                            logger.warning("setProductPrice batch %d failed: %s", i // batch_size, e)
+                            break  # endpoint likely unsupported — stop trying
+                except Exception as e:
+                    logger.warning("Product price push skipped: %s", e)
+
+            await self.log(LogType.INFO, "Product Sync",
+                           f"Synced {len(sd_products)} products ({len(sd_product_prices)} with price) to Sales Doctor")
 
         except Exception as e:
             logger.warning("sync_products_to_salesdoctor failed: %s", e)
@@ -1223,13 +1322,107 @@ class SyncService:
             logger.warning("SD getAgent failed: %s", e)
             return None
 
+    async def _load_sd_agents_index(self) -> Dict[str, Dict[str, str]]:
+        """Build and cache an index of SD agents by lowercased name.
+
+        Returns: {agent_name_lc: {"SD_id": ..., "code_1C": ...}}
+        Used to match a MoySklad client's owner (agent) to its SD counterpart
+        so each client is bound to the right agent.
+        """
+        if not self.sd:
+            return {}
+        cached = SyncService._sd_agents_by_name.get(self.tenant.id)
+        if cached is not None:
+            return cached
+        index: Dict[str, Dict[str, str]] = {}
+        try:
+            result = await self.sd._rpc("getAgent", {})
+            agents = result.get("agent", []) if isinstance(result, dict) else []
+            for a in agents:
+                name = (a.get("name") or a.get("fio") or "").strip().lower()
+                if not name:
+                    continue
+                ref: Dict[str, str] = {}
+                if a.get("SD_id"):
+                    ref["SD_id"] = a["SD_id"]
+                if a.get("code_1C"):
+                    ref["code_1C"] = a["code_1C"]
+                if ref:
+                    index[name] = ref
+        except Exception as e:
+            logger.warning("SD agents index load failed: %s", e)
+        SyncService._sd_agents_by_name[self.tenant.id] = index
+        return index
+
+    async def _resolve_agent_for_ms_owner(self, owner_block: Optional[Dict]) -> Optional[Dict]:
+        """Map a MoySklad client.owner (employee) to a SD agent reference.
+
+        Tries to match by name (case-insensitive). Falls back to the default
+        agent so existing logic still produces a valid SD order.
+        """
+        if not owner_block or not isinstance(owner_block, dict):
+            return await self._get_sd_default_agent()
+
+        owner_name = (owner_block.get("name") or "").strip().lower()
+        if owner_name:
+            index = await self._load_sd_agents_index()
+            ref = index.get(owner_name)
+            if ref:
+                return ref
+            # Try a softer match: first-name only
+            first = owner_name.split()[0] if owner_name else ""
+            for key, ref in index.items():
+                if key.startswith(first):
+                    return ref
+
+        return await self._get_sd_default_agent()
+
+    def _extract_gps_from_ms_counterparty(self, cp: Dict) -> str:
+        """Extract a 'lat,lon' string from a MoySklad counterparty if available.
+
+        MoySklad stores GPS via custom attributes (атрибуты): each attribute has
+        a name and value. We look for an attribute whose name contains 'gps',
+        'координат', or 'lat/lon'. Returns empty string if not found.
+        """
+        if not isinstance(cp, dict):
+            return ""
+        attrs = cp.get("attributes") or []
+        if not isinstance(attrs, list):
+            return ""
+        lat = lon = None
+        for a in attrs:
+            if not isinstance(a, dict):
+                continue
+            name = (a.get("name") or "").lower()
+            value = a.get("value")
+            if value is None:
+                continue
+            s = str(value)
+            if "gps" in name or "координат" in name or "geo" in name:
+                # Expect "lat,lon" or "lat;lon"
+                for sep in (",", ";"):
+                    if sep in s:
+                        parts = [p.strip() for p in s.split(sep, 1)]
+                        if len(parts) == 2:
+                            return f"{parts[0]},{parts[1]}"
+            if "lat" in name and lat is None:
+                lat = s.strip()
+            if ("lon" in name or "lng" in name) and lon is None:
+                lon = s.strip()
+        if lat and lon:
+            return f"{lat},{lon}"
+        return ""
+
     def _build_sd_client(self, name: str, phone: str, address: str = "",
                          client_type: str = "retail", category: Dict = None,
-                         location: str = "") -> Dict:
+                         location: str = "", agent: Optional[Dict] = None) -> Dict:
         """Build a Sales Doctor client dict with required fields.
 
         location: optional "lat,lon" comma-separated GPS string. If parseable,
         populates lat/lon for SD client (used for territory navigation).
+        agent: optional {"SD_id": ...} or {"code_1C": ...} reference. Binds
+        the client to its assigned SD agent so the courier app shows only
+        relevant clients to that agent.
         """
         code = phone or name
         lat = ""
@@ -1254,6 +1447,8 @@ class SyncService:
         }
         if category:
             d["clientCategory"] = category
+        if agent:
+            d["agent"] = agent
         return d
 
     async def _ensure_sd_warehouses(self, ms_wh_codes: List[str]):
