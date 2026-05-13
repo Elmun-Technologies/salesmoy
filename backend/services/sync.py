@@ -50,6 +50,11 @@ class SyncService:
     # expand currency) to apply the correct conversion.
     _product_currencies: Dict[int, Dict[str, str]] = {}
 
+    # Tracks whether the initial full client sync has been performed for
+    # a tenant in this worker. After restart the flag clears, so a fresh
+    # full sync will run once and subsequent loops stay incremental.
+    _initial_clients_synced: Dict[int, bool] = {}
+
     # Default currency to assume when MoySklad data doesn't expose it.
     # Set this to "USD" for tenants whose MoySklad catalog is priced in $.
     _default_price_currency: Dict[int, str] = {}
@@ -176,16 +181,28 @@ class SyncService:
             return None
 
     async def sync_clients_from_moysklad(self):
-        """Pull recently updated clients from MoySklad to local DB.
+        """Pull clients from MoySklad to local DB.
 
-        Only fetches clients updated in the last 24 hours. Initial full import
-        is not done automatically — only new/changed clients are synced.
+        First run for this worker: fetches the ENTIRE catalog with pagination
+        so every client appears in Sales Doctor. Subsequent runs use a 24-hour
+        incremental window. The "initial full sync" flag clears on restart, so
+        relaunching the backend forces another full reconciliation.
         """
         if not self.ms:
             return
 
         try:
-            counterparties = await self.ms.get_counterparties(days_back=1)
+            is_initial = not SyncService._initial_clients_synced.get(self.tenant.id, False)
+            if is_initial:
+                # Fetch EVERY counterparty so SD ends up with the full client list
+                counterparties = await self.ms.get_counterparties(paginate_all=True)
+                logger.info(
+                    "[Tenant %s] Initial client sync — fetched %d counterparties",
+                    self.tenant.id, len(counterparties),
+                )
+            else:
+                # Incremental: only clients changed in the last 24h
+                counterparties = await self.ms.get_counterparties(days_back=1)
             synced = 0
             merged = 0
 
@@ -289,7 +306,13 @@ class SyncService:
                 except Exception as e:
                     await self.log(LogType.ERROR, "Client Sync", f"SalesDoctor push failed: {e}")
 
+            # Mark initial full sync as done so future cycles use incremental window
+            if is_initial:
+                SyncService._initial_clients_synced[self.tenant.id] = True
+
             msg = f"Synced {synced} clients"
+            if is_initial:
+                msg = f"Initial full sync — {msg} from MoySklad"
             if merged:
                 msg += f", merged {merged} duplicates"
             await self.log(LogType.SUCCESS, "Client Sync", msg)

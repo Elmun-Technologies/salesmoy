@@ -69,25 +69,44 @@ class MoySkladClient:
     # ========== Counterparty (Clients) ==========
 
     async def get_counterparties(
-        self, phone: Optional[str] = None, days_back: Optional[int] = None
+        self, phone: Optional[str] = None, days_back: Optional[int] = None,
+        paginate_all: bool = False,
     ) -> List[Dict]:
         """Get counterparties (clients), optionally filtered by phone or recently updated.
 
         Expands `owner` (assigned MoySklad employee/agent) so callers can bind each
         Sales Doctor client to the correct agent, and route delivery/orders by agent.
+
+        paginate_all=True walks every page (used for an initial full client sync).
+        Without it, only the first 1000 rows are returned (incremental window).
         """
         from datetime import datetime, timedelta
-        params: Dict[str, Any] = {"limit": 100, "expand": "owner"}
-        filters = []
+        base_filters: List[str] = []
         if phone:
-            filters.append(f"phone={phone}")
+            base_filters.append(f"phone={phone}")
         if days_back is not None:
             since = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d %H:%M:%S")
-            filters.append(f"updated>{since}")
-        if filters:
-            params["filter"] = ";".join(filters)
-        data = await self._request("GET", "/entity/counterparty", params=params)
-        return data.get("rows", [])
+            base_filters.append(f"updated>{since}")
+
+        all_rows: List[Dict] = []
+        offset = 0
+        page_size = 1000
+        while True:
+            params: Dict[str, Any] = {
+                "limit": page_size,
+                "offset": offset,
+                "expand": "owner",
+            }
+            if base_filters:
+                params["filter"] = ";".join(base_filters)
+            data = await self._request("GET", "/entity/counterparty", params=params)
+            rows = data.get("rows", [])
+            all_rows.extend(rows)
+            total = data.get("meta", {}).get("size", 0)
+            offset += len(rows)
+            if not paginate_all or not rows or offset >= total:
+                break
+        return all_rows
 
     async def get_counterparty(self, counterparty_id: str) -> Dict:
         """Get single counterparty by ID."""
