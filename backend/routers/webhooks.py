@@ -142,15 +142,67 @@ async def moysklad_webhook(
                 await service.log(LogType.ERROR, "Webhook", f"Counterparty {action} failed: {e}")
 
         elif "demand" in entity_type:
-            # Demand (отгрузка) yaratildi → MS buyurtma statusini "Отгружен" ga o'tkazib SD'ga ham yuboramiz
+            # Demand (отгрузка) yaratildi/yangilandi:
+            # 1) Buyurtma statusini "Отгружен" ga o'tkazamiz
+            # 2) Demand atributlaridan GPS o'qib SD klientini yangilaymiz
             try:
-                if service.ms and action == "CREATE":
-                    demand = await service.ms._request("GET", f"/entity/demand/{entity_id}",
-                                                      params={"expand": "customerOrder"})
+                if service.ms and action in ("CREATE", "UPDATE"):
+                    demand = await service.ms._request(
+                        "GET", f"/entity/demand/{entity_id}",
+                        params={"expand": "customerOrder,agent"},
+                    )
+
+                    # --- 1) Order status update ---
                     co = demand.get("customerOrder") or {}
                     co_id = co.get("id") if isinstance(co, dict) else ""
-                    if co_id:
+                    if co_id and action == "CREATE":
                         await service.update_order_status_from_moysklad(co_id, "Отгружен")
+
+                    # --- 2) GPS extraction from demand attributes → SD client ---
+                    if service.sd:
+                        attrs = demand.get("attributes") or []
+                        gps_str = ""
+                        for attr in attrs:
+                            if not isinstance(attr, dict):
+                                continue
+                            name = (attr.get("name") or "").strip().lower()
+                            if name == "gps" or "gps" in name or "координат" in name:
+                                raw = str(attr.get("value") or "").strip()
+                                gps_str = service._parse_gps_from_string(raw)
+                                if gps_str:
+                                    break
+
+                        if gps_str:
+                            # Get client info from demand's agent (counterparty)
+                            agent = demand.get("agent") or {}
+                            client_name = agent.get("name", "") if isinstance(agent, dict) else ""
+                            client_phone = agent.get("phone", "") if isinstance(agent, dict) else ""
+                            client_code = client_phone or client_name
+                            address = service._ms_address(agent) if isinstance(agent, dict) else ""
+
+                            if client_code:
+                                try:
+                                    category = await service._get_sd_category_id("retail")
+                                    owner = agent.get("owner") if isinstance(agent, dict) else None
+                                    agent_ref = await service._resolve_agent_for_ms_owner(owner)
+                                    sd_client = service._build_sd_client(
+                                        name=client_name or client_code,
+                                        phone=client_phone,
+                                        address=address,
+                                        client_type="retail",
+                                        category=category,
+                                        location=gps_str,
+                                        agent=agent_ref,
+                                    )
+                                    await service.sd.set_client([sd_client])
+                                    await service.log(
+                                        LogType.SUCCESS, "Webhook",
+                                        f"Demand GPS → SD client {client_code}: {gps_str}",
+                                    )
+                                except Exception as e:
+                                    await service.log(LogType.WARNING, "Webhook",
+                                                      f"Demand GPS setClient failed: {e}")
+
                 await service.log(LogType.SUCCESS, "Webhook", f"Demand {action}: {entity_id}")
             except Exception as e:
                 await service.log(LogType.ERROR, "Webhook", f"Demand {action} failed: {e}")
