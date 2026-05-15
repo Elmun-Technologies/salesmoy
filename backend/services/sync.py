@@ -261,7 +261,7 @@ class SyncService:
                         moysklad_id=ms_id,
                         name=name,
                         phone=phone,
-                        address=cp.get("actualAddress", ""),
+                        address=self._ms_address(cp),
                         client_type=ClientType.RETAIL,
                         is_duplicate=False,
                     )
@@ -287,7 +287,7 @@ class SyncService:
                         sd_clients_batch.append(self._build_sd_client(
                             name=cp_name,
                             phone=cp_phone,
-                            address=cp.get("actualAddress", ""),
+                            address=self._ms_address(cp),
                             client_type="retail",
                             category=category,
                             agent=agent_ref,
@@ -461,8 +461,9 @@ class SyncService:
         # Delivery address: prefer order's shipmentAddress, fall back to client's actual address
         delivery_address = (
             ms_order.get("shipmentAddress")
-            or ms_order.get("shipmentAddressFull", {}).get("comment", "") if isinstance(ms_order.get("shipmentAddressFull"), dict) else ""
-        ) or agent_data.get("actualAddress", "") or ""
+            or (ms_order.get("shipmentAddressFull", {}).get("comment", "") if isinstance(ms_order.get("shipmentAddressFull"), dict) else "")
+            or self._ms_address(agent_data)
+        )
 
         order_name = ms_order.get("name", ms_id[:8])
         # MoySklad returns sum in kopecks; normalize to UZS using order currency
@@ -868,8 +869,7 @@ class SyncService:
         description = ms_order.get("description", order.comment or "")
         delivery_address = (
             ms_order.get("shipmentAddress")
-            or agent_data.get("actualAddress", "")
-            or ""
+            or self._ms_address(agent_data)
         )
         client_lat_lon = self._extract_gps_from_ms_counterparty(agent_data)
         agent_ref = await self._resolve_agent_for_ms_owner(client_owner)
@@ -1500,12 +1500,70 @@ class SyncService:
 
         return await self._get_sd_default_agent()
 
+    @staticmethod
+    def _ms_address(cp: Dict) -> str:
+        """Return the best available address string from a MoySklad counterparty.
+
+        Priority: actualAddress → legalAddress → empty string.
+        Both fields are plain strings in MoySklad API. actualAddress is often
+        empty even when legalAddress is filled, so we fall back automatically.
+        """
+        if not isinstance(cp, dict):
+            return ""
+        return (
+            (cp.get("actualAddress") or "").strip()
+            or (cp.get("legalAddress") or "").strip()
+        )
+
+    @staticmethod
+    def _parse_gps_from_string(s: str) -> str:
+        """Try to extract 'lat,lon' from a raw string.
+
+        Handles formats:
+          • "41.2995,69.2401"            plain lat,lon
+          • "41.2995;69.2401"            semicolon separator
+          • Yandex Maps short link text containing ll=lat,lon
+          • https://yandex.com/maps/...?ll=lon,lat&...   (Yandex uses lon,lat order!)
+          • https://maps.google.com/...@lat,lon,...
+          • Google Maps: "41.2995, 69.2401"
+        Returns "lat,lon" or "" if not parseable.
+        """
+        import re
+        s = s.strip()
+        if not s:
+            return ""
+
+        # Yandex Maps URL: ll=lon,lat (NOTE: Yandex is reversed — lon first!)
+        m = re.search(r'[?&]ll=([-\d.]+),([-\d.]+)', s)
+        if m:
+            lon_y, lat_y = m.group(1), m.group(2)
+            return f"{lat_y},{lon_y}"
+
+        # Google Maps URL: @lat,lon
+        m = re.search(r'@([-\d.]+),([-\d.]+)', s)
+        if m:
+            return f"{m.group(1)},{m.group(2)}"
+
+        # Plain "lat,lon" or "lat;lon" (two numbers)
+        for sep in (",", ";"):
+            parts = [p.strip() for p in s.split(sep, 1)]
+            if len(parts) == 2:
+                try:
+                    la, lo = float(parts[0]), float(parts[1])
+                    # Sanity check: lat in [-90,90], lon in [-180,180]
+                    if -90 <= la <= 90 and -180 <= lo <= 180:
+                        return f"{la},{lo}"
+                except ValueError:
+                    pass
+        return ""
+
     def _extract_gps_from_ms_counterparty(self, cp: Dict) -> str:
         """Extract a 'lat,lon' string from a MoySklad counterparty if available.
 
         MoySklad stores GPS via custom attributes (атрибуты): each attribute has
         a name and value. We look for an attribute whose name contains 'gps',
-        'координат', or 'lat/lon'. Returns empty string if not found.
+        'координат', 'geo', or 'lat/lon'. Also handles Yandex/Google Maps links.
+        Returns empty string if not found.
         """
         if not isinstance(cp, dict):
             return ""
@@ -1521,19 +1579,19 @@ class SyncService:
             if value is None:
                 continue
             s = str(value)
-            if "gps" in name or "координат" in name or "geo" in name:
-                # Expect "lat,lon" or "lat;lon"
-                for sep in (",", ";"):
-                    if sep in s:
-                        parts = [p.strip() for p in s.split(sep, 1)]
-                        if len(parts) == 2:
-                            return f"{parts[0]},{parts[1]}"
+            if "gps" in name or "координат" in name or "geo" in name or "location" in name or "manzil" in name:
+                # Try full parse (handles links, plain coords, etc.)
+                parsed = self._parse_gps_from_string(s)
+                if parsed:
+                    return parsed
             if "lat" in name and lat is None:
                 lat = s.strip()
             if ("lon" in name or "lng" in name) and lon is None:
                 lon = s.strip()
         if lat and lon:
-            return f"{lat},{lon}"
+            # Validate and return
+            parsed = self._parse_gps_from_string(f"{lat},{lon}")
+            return parsed if parsed else f"{lat},{lon}"
         return ""
 
     def _build_sd_client(self, name: str, phone: str, address: str = "",
