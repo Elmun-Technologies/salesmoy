@@ -34,10 +34,24 @@ class Settings(BaseSettings):
     test_mode: bool = False
     cors_origins: str = "http://localhost:5173,http://localhost:3000"
 
-    # Sync intervals (seconds)
-    stock_sync_interval: int = 15
+    # Sync intervals (seconds). The background loops honor these — keep them
+    # high enough to avoid hammering MoySklad/SD with API calls, but low enough
+    # that agents see fresh data within a reasonable delay.
+    #
+    # Stock: cheap (one MS bulk call + one SD batch) — 60s feels live.
+    # Debts: expensive (per-counterparty) — every 10 min is plenty.
+    # Clients: pulls incremental window — every 5 min.
+    # Orders: latency-sensitive — every minute.
+    stock_sync_interval: int = 60
     debt_sync_interval: int = 600
     client_sync_interval: int = 300
+    order_sync_interval: int = 60
+
+    # MoySklad-side: how many days back to scan on the first order sync after
+    # restart. After that the system relies on webhooks + the incremental loop.
+    # Set higher (e.g. 7) when migrating an existing tenant; 1 is enough for
+    # steady-state operation.
+    initial_order_lookback_days: int = 1
 
     # Currency exchange rate (USD to UZS)
     # MoySklad prices are in USD, Sales Doctor expects UZS

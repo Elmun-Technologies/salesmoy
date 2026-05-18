@@ -1,7 +1,7 @@
-"""MoySklad API client with retry logic and error handling."""
+"""MoySklad API client with retry logic, error handling, and token refresh."""
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -17,12 +17,33 @@ class MoySkladError(Exception):
     pass
 
 
-class MoySkladClient:
-    """HTTP client for MoySklad API."""
+class MoySkladAuthError(MoySkladError):
+    """Raised when MoySklad rejects the token (401) and refresh isn't possible."""
+    pass
 
-    def __init__(self, token: str = ""):
+
+# Callback signature: () -> new_access_token | None
+# Returning None means "refresh failed — give up on this request".
+RefreshCallback = Callable[[], Awaitable[Optional[str]]]
+
+
+class MoySkladClient:
+    """HTTP client for MoySklad API.
+
+    On HTTP 401 the client invokes `refresh_callback` (if supplied) to obtain
+    a new access token, replaces its Authorization header, and replays the
+    request ONCE. The callback is responsible for persisting the new token
+    to the database; this class only updates its own in-memory header.
+    """
+
+    def __init__(
+        self,
+        token: str = "",
+        refresh_callback: Optional[RefreshCallback] = None,
+    ):
         self.base_url = settings.moysklad_base_url
         self.token = token or settings.moysklad_token
+        self.refresh_callback = refresh_callback
         self.headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
@@ -37,10 +58,18 @@ class MoySkladClient:
     async def close(self):
         await self.client.aclose()
 
+    def _apply_token(self, new_token: str) -> None:
+        """Swap the in-memory token after a successful refresh."""
+        self.token = new_token
+        self.client.headers["Authorization"] = f"Bearer {new_token}"
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         reraise=True,
+        # Do NOT retry auth failures — `tenacity` shouldn't burn attempts
+        # against a dead token. We handle 401 explicitly inside _request.
+        retry=lambda r: not isinstance(r.outcome.exception(), MoySkladAuthError) if r.outcome else False,
     )
     async def _request(
         self,
@@ -48,8 +77,9 @@ class MoySkladClient:
         endpoint: str,
         json_data: Optional[Dict] = None,
         params: Optional[Dict] = None,
+        _is_retry_after_refresh: bool = False,
     ) -> Dict[str, Any]:
-        """Make HTTP request with retry logic."""
+        """Make HTTP request with retry logic and one-shot token refresh on 401."""
         try:
             response = await self.client.request(
                 method=method,
@@ -60,8 +90,35 @@ class MoySkladClient:
             response.raise_for_status()
             return response.json() if response.content else {}
         except httpx.HTTPStatusError as e:
-            logger.error(f"MoySklad HTTP error {e.response.status_code}: {e.response.text}")
-            raise MoySkladError(f"HTTP {e.response.status_code}: {e.response.text}")
+            status = e.response.status_code
+            body = e.response.text
+            # ---- 401: try one token refresh, then replay once ----
+            if status == 401 and self.refresh_callback and not _is_retry_after_refresh:
+                logger.warning("MoySklad 401 — attempting token refresh")
+                try:
+                    new_token = await self.refresh_callback()
+                except Exception as refresh_err:
+                    logger.error("MoySklad token refresh raised: %s", refresh_err)
+                    new_token = None
+                if new_token:
+                    self._apply_token(new_token)
+                    logger.info("MoySklad token refreshed — replaying request")
+                    return await self._request(
+                        method, endpoint, json_data=json_data, params=params,
+                        _is_retry_after_refresh=True,
+                    )
+                # Refresh failed — surface a distinct error so tenacity doesn't retry
+                logger.error("MoySklad token refresh failed — credential update required")
+                raise MoySkladAuthError(
+                    f"MoySklad token expired and refresh failed. Re-authorize "
+                    f"the tenant. Original: HTTP {status}: {body}"
+                )
+            if status == 401:
+                # No refresh callback configured — surface a clear, non-retryable error
+                logger.error("MoySklad HTTP 401 (no refresh configured): %s", body)
+                raise MoySkladAuthError(f"HTTP 401: {body}")
+            logger.error(f"MoySklad HTTP error {status}: {body}")
+            raise MoySkladError(f"HTTP {status}: {body}")
         except httpx.RequestError as e:
             logger.error(f"MoySklad request error: {e}")
             raise MoySkladError(f"Request failed: {e}")

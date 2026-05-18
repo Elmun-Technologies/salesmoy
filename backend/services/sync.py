@@ -16,6 +16,7 @@ from services.moysklad import MoySkladClient
 from services.salesdoctor import SalesDoctorClient, MS_STATUS_TO_SD
 from services.exchange_rate import get_usd_to_uzs_rate
 from utils.currency import convert_usd_to_uzs_with_live_rate
+from utils.phone import normalize_phone
 
 logger = logging.getLogger(__name__)
 
@@ -66,9 +67,22 @@ class SyncService:
         self.sd = None
 
     async def init_clients(self):
-        """Initialize API clients with tenant credentials."""
+        """Initialize API clients with tenant credentials.
+
+        Proactively refreshes the MoySklad access token if it's expired (or
+        about to expire in the next 60 seconds) and a refresh_token is present.
+        The MoySkladClient also gets a refresh callback so any 401 mid-sync
+        triggers a one-shot refresh + replay (instead of breaking the cycle).
+        """
         if self.tenant.moysklad_access_token:
-            self.ms = MoySkladClient(token=self.tenant.moysklad_access_token)
+            # Proactive refresh — avoid burning the first batch of calls on a token
+            # we already know is dead.
+            await self._maybe_refresh_moysklad_token(grace_seconds=60)
+
+            self.ms = MoySkladClient(
+                token=self.tenant.moysklad_access_token,
+                refresh_callback=self._refresh_moysklad_token,
+            )
             # Auto-discover and persist accountId for webhook routing
             if not self.tenant.moysklad_account_id:
                 try:
@@ -86,6 +100,79 @@ class SyncService:
                 token=self.tenant.salesdoctor_token,
                 filial_id=self.tenant.salesdoctor_filial_id or 0,
             )
+
+    # ========== MoySklad token refresh ==========
+
+    async def _maybe_refresh_moysklad_token(self, grace_seconds: int = 60) -> bool:
+        """Refresh MoySklad token if it's expired or expires within grace_seconds.
+
+        Returns True if a refresh was attempted AND succeeded.
+        Returns False if no refresh was needed, or it failed (caller decides what to do).
+        """
+        from datetime import datetime, timedelta
+        expires = self.tenant.moysklad_token_expires
+        if not expires:
+            # No known expiry — assume permanent token, don't preemptively refresh.
+            return False
+        if expires > datetime.utcnow() + timedelta(seconds=grace_seconds):
+            return False
+        if not self.tenant.moysklad_refresh_token:
+            logger.warning(
+                "Tenant %s MoySklad token expired at %s and no refresh_token saved",
+                self.tenant.id, expires,
+            )
+            return False
+        new_token = await self._refresh_moysklad_token()
+        return bool(new_token)
+
+    async def _refresh_moysklad_token(self) -> Optional[str]:
+        """Call MoySklad OAuth refresh endpoint and persist the new tokens.
+
+        Returns the new access token on success, None on failure.
+        Used both proactively (from init_clients) and reactively (as the
+        MoySkladClient.refresh_callback on 401).
+        """
+        from datetime import datetime, timedelta
+        from services.moysklad_oauth import MoySkladOAuth
+        from config import get_settings as _gs
+
+        s = _gs()
+        if not s.moysklad_client_id or not s.moysklad_client_secret:
+            logger.error(
+                "Tenant %s: cannot refresh MoySklad token — MOYSKLAD_CLIENT_ID/"
+                "CLIENT_SECRET not configured. Re-authorize via admin panel.",
+                self.tenant.id,
+            )
+            return None
+        if not self.tenant.moysklad_refresh_token:
+            logger.error(
+                "Tenant %s: cannot refresh MoySklad token — no refresh_token saved.",
+                self.tenant.id,
+            )
+            return None
+        try:
+            oauth = MoySkladOAuth(
+                client_id=s.moysklad_client_id,
+                client_secret=s.moysklad_client_secret,
+                redirect_uri=s.moysklad_redirect_uri,
+            )
+            tokens = await oauth.refresh_access_token(self.tenant.moysklad_refresh_token)
+            new_access = tokens.get("access_token")
+            new_refresh = tokens.get("refresh_token") or self.tenant.moysklad_refresh_token
+            expires_in = int(tokens.get("expires_in", 86400))
+            if not new_access:
+                logger.error("MoySklad refresh returned no access_token: %s", tokens)
+                return None
+            self.tenant.moysklad_access_token = new_access
+            self.tenant.moysklad_refresh_token = new_refresh
+            self.tenant.moysklad_token_expires = datetime.utcnow() + timedelta(seconds=expires_in)
+            await self.db.commit()
+            logger.info("Tenant %s: MoySklad token refreshed (expires_in=%ds)",
+                        self.tenant.id, expires_in)
+            return new_access
+        except Exception as e:
+            logger.error("Tenant %s: MoySklad token refresh failed: %s", self.tenant.id, e)
+            return None
 
     # ========== Logging ==========
 
@@ -119,10 +206,12 @@ class SyncService:
             return None
 
         try:
-            phone = client_data.get("phone", "")
+            phone = normalize_phone(client_data.get("phone", ""))
             name = client_data.get("name", "")
 
-            existing = await self.ms.get_counterparties(phone=phone)
+            # Search MoySklad by normalized phone — without normalization,
+            # a "+998..." stored client wouldn't be found when SD sends "998...".
+            existing = await self.ms.get_counterparties(phone=phone) if phone else []
 
             if existing:
                 ms_client = existing[0]
@@ -207,7 +296,10 @@ class SyncService:
             merged = 0
 
             for cp in counterparties:
-                phone = cp.get("phone", "").strip()
+                # Normalize phone to canonical "+998XXXXXXXXX" so the same
+                # human entered as "+998 90 ...", "998 90 ...", "(90) ..."
+                # all resolve to one DB row.
+                phone = normalize_phone(cp.get("phone", ""))
                 name = cp.get("name", "").strip()
                 ms_id = cp.get("id", "")
 
@@ -278,7 +370,7 @@ class SyncService:
                     sd_clients_batch = []
                     for cp in counterparties:
                         cp_name = cp.get("name", "").strip()
-                        cp_phone = cp.get("phone", "").strip()
+                        cp_phone = normalize_phone(cp.get("phone", ""))
                         if not cp_name:
                             continue
                         # Bind each client to its MoySklad owner (assigned agent)
@@ -454,7 +546,9 @@ class SyncService:
         # Parse counterparty (client) — note: MoySklad calls this "agent" (контрагент)
         agent_data = ms_order.get("agent", {})
         client_name = agent_data.get("name", "")
-        client_phone = agent_data.get("phone", "") or agent_data.get("actualPhone", "")
+        client_phone = normalize_phone(
+            agent_data.get("phone", "") or agent_data.get("actualPhone", "")
+        )
         # Owner = the MoySklad employee (sales agent) assigned to this client.
         # Used to bind both client and order to the correct SD agent.
         client_owner = agent_data.get("owner") if isinstance(agent_data, dict) else None
@@ -603,8 +697,11 @@ class SyncService:
             return
 
         try:
-            # Only last 24 hours — no historical import
-            ms_orders = await self.ms.get_customer_orders(limit=100, expand=False, days_back=1)
+            # Incremental window — covers the case where webhooks were missed
+            # (e.g. backend restart). Webhooks handle real-time, this is the safety net.
+            from config import get_settings as _gs
+            lookback = max(1, _gs().initial_order_lookback_days)
+            ms_orders = await self.ms.get_customer_orders(limit=100, expand=False, days_back=lookback)
             synced = 0
 
             for ms_order_brief in ms_orders:
@@ -863,7 +960,9 @@ class SyncService:
 
         agent_data = ms_order.get("agent", {})
         client_name = agent_data.get("name", order.client_name or "")
-        client_phone = (agent_data.get("phone") or agent_data.get("actualPhone") or order.client_phone or "")
+        client_phone = normalize_phone(
+            agent_data.get("phone") or agent_data.get("actualPhone") or order.client_phone or ""
+        )
         client_owner = agent_data.get("owner") if isinstance(agent_data, dict) else None
         state_name = ms_order.get("state", {}).get("name", "Новый") if isinstance(ms_order.get("state"), dict) else "Новый"
         description = ms_order.get("description", order.comment or "")
@@ -1604,8 +1703,14 @@ class SyncService:
         agent: optional {"SD_id": ...} or {"code_1C": ...} reference. Binds
         the client to its assigned SD agent so the courier app shows only
         relevant clients to that agent.
+
+        The code_1C is the canonical client key — same number formatted three
+        different ways must produce the SAME code, or SD ends up with duplicates.
         """
-        code = phone or name
+        normalized_phone = normalize_phone(phone)
+        # tel is what SD displays — also canonical so courier app shows it consistently.
+        tel = normalized_phone or phone
+        code = normalized_phone or name
         lat = ""
         lon = ""
         if location and "," in location:
@@ -1620,7 +1725,7 @@ class SyncService:
             "code_1C": code,
             "shortName": name,
             "firmName": name,
-            "tel": phone,
+            "tel": tel,
             "address": address,
             "orentir": "", "comment": "",
             "lat": lat, "lon": lon,

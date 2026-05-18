@@ -33,118 +33,80 @@ logger = logging.getLogger(__name__)
 
 # ========== Background Tasks ==========
 
-async def stock_sync_loop():
-    """Background task to sync stock for all active tenants."""
-    from services.moysklad import get_moysklad_client
-    from services.salesdoctor import get_salesdoctor_client
+async def _run_sync_for_all_tenants(method_names: list[str], label: str) -> None:
+    """Iterate all active tenants and run the given SyncService methods.
+
+    `method_names` are called in order on each tenant's SyncService instance.
+    Per-tenant failures are isolated — one bad tenant can't break the others.
+    """
     from services.sync import SyncService
     from database import AsyncSessionLocal
     from sqlalchemy import select
     from models import Tenant
 
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Tenant).where(Tenant.is_active == True))
+        tenants = result.scalars().all()
+        for tenant in tenants:
+            try:
+                service = SyncService(db, tenant)
+                await service.init_clients()
+                for m in method_names:
+                    await getattr(service, m)()
+            except Exception as e:
+                logger.error(f"{label} error for tenant {tenant.id}: {e}")
+
+
+async def stock_sync_loop():
+    """Background task to sync stock + products for all active tenants."""
+    from config import get_settings
+    interval = max(15, get_settings().stock_sync_interval)
     while True:
         try:
-            await asyncio.sleep(60)  # 60s: reduce CPU from 67% → ~15%
-            async with AsyncSessionLocal() as db:
-                result = await db.execute(
-                    select(Tenant).where(Tenant.is_active == True)
-                )
-                tenants = result.scalars().all()
-
-                for tenant in tenants:
-                    try:
-                        service = SyncService(db, tenant)
-                        await service.init_clients()
-                        await service.sync_stock()
-                    except Exception as e:
-                        logger.error(f"Stock sync error for tenant {tenant.id}: {e}")
-
+            await asyncio.sleep(interval)
+            await _run_sync_for_all_tenants(["sync_stock"], label="Stock sync")
         except Exception as e:
             logger.error(f"Stock sync loop error: {e}")
 
 
 async def debt_sync_loop():
     """Background task to sync debts for all active tenants."""
-    from services.sync import SyncService
-    from database import AsyncSessionLocal
-    from sqlalchemy import select
-    from models import Tenant
-
+    from config import get_settings
+    interval = max(60, get_settings().debt_sync_interval)
     while True:
         try:
-            await asyncio.sleep(600)
-            async with AsyncSessionLocal() as db:
-                result = await db.execute(
-                    select(Tenant).where(Tenant.is_active == True)
-                )
-                tenants = result.scalars().all()
-
-                for tenant in tenants:
-                    try:
-                        service = SyncService(db, tenant)
-                        await service.init_clients()
-                        await service.sync_debts()
-                    except Exception as e:
-                        logger.error(f"Debt sync error for tenant {tenant.id}: {e}")
-
+            await asyncio.sleep(interval)
+            await _run_sync_for_all_tenants(["sync_debts"], label="Debt sync")
         except Exception as e:
             logger.error(f"Debt sync loop error: {e}")
 
 
 async def client_sync_loop():
     """Background task to sync clients for all active tenants."""
-    from services.sync import SyncService
-    from database import AsyncSessionLocal
-    from sqlalchemy import select
-    from models import Tenant
-
+    from config import get_settings
+    interval = max(60, get_settings().client_sync_interval)
     while True:
         try:
-            await asyncio.sleep(300)
-            async with AsyncSessionLocal() as db:
-                result = await db.execute(
-                    select(Tenant).where(Tenant.is_active == True)
-                )
-                tenants = result.scalars().all()
-
-                for tenant in tenants:
-                    try:
-                        service = SyncService(db, tenant)
-                        await service.init_clients()
-                        await service.sync_clients_from_moysklad()
-                        await service.sync_clients_from_salesdoctor()
-                    except Exception as e:
-                        logger.error(f"Client sync error for tenant {tenant.id}: {e}")
-
+            await asyncio.sleep(interval)
+            await _run_sync_for_all_tenants(
+                ["sync_clients_from_moysklad", "sync_clients_from_salesdoctor"],
+                label="Client sync",
+            )
         except Exception as e:
             logger.error(f"Client sync loop error: {e}")
 
 
 async def order_sync_loop():
-    """Background task to pull new orders from MoySklad → Sales Doctor for all tenants."""
-    from services.sync import SyncService
-    from database import AsyncSessionLocal
-    from sqlalchemy import select
-    from models import Tenant
-
+    """Background task to pull new orders from MoySklad → Sales Doctor."""
+    from config import get_settings
+    interval = max(60, get_settings().order_sync_interval)
     while True:
         try:
-            await asyncio.sleep(300)  # every 5 minutes
-            async with AsyncSessionLocal() as db:
-                result = await db.execute(
-                    select(Tenant).where(Tenant.is_active == True)
-                )
-                tenants = result.scalars().all()
-
-                for tenant in tenants:
-                    try:
-                        service = SyncService(db, tenant)
-                        await service.init_clients()
-                        await service.sync_orders_from_moysklad()
-                        await service.sync_orders_from_salesdoctor()
-                    except Exception as e:
-                        logger.error(f"Order sync error for tenant {tenant.id}: {e}")
-
+            await asyncio.sleep(interval)
+            await _run_sync_for_all_tenants(
+                ["sync_orders_from_moysklad", "sync_orders_from_salesdoctor"],
+                label="Order sync",
+            )
         except Exception as e:
             logger.error(f"Order sync loop error: {e}")
 

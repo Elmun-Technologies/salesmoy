@@ -257,9 +257,12 @@ UI: http://localhost:5173
 | `MOYSKLAD_REDIRECT_URI` | Faqat OAuth | MoySklad developer konsolindagi sozlamalar bilan mos kelishi kerak |
 | `MOYSKLAD_TOKEN` | Faqat dev | Ishlab chiqish/test uchun global token |
 | `MOYSKLAD_BASE_URL` | | Standart: `https://api.moysklad.ru/api/remap/1.2` |
-| `STOCK_SYNC_INTERVAL` | | Sklad sinxronlari orasidagi soniyalar. Standart: `15` |
+| `STOCK_SYNC_INTERVAL` | | Sklad sinxronlari orasidagi soniyalar. Standart: `60` |
 | `DEBT_SYNC_INTERVAL` | | Qarz sinxronlari orasidagi soniyalar. Standart: `600` |
 | `CLIENT_SYNC_INTERVAL` | | Klient sinxronlari orasidagi soniyalar. Standart: `300` |
+| `ORDER_SYNC_INTERVAL` | | Buyurtma sinxronlari orasidagi soniyalar. Standart: `60` |
+| `INITIAL_ORDER_LOOKBACK_DAYS` | | Dastlabki buyurtma sinxronida nechta kun orqaga qarash. Standart: `1` (webhook'lar real-time ishlaydi, bu xavfsizlik tarmog'i) |
+| `FORCE_PRICE_CURRENCY` | | `USD` — MoySklad isoCode'ni e'tiborga olmasdan barcha narxlarni USD deb hisoblash |
 | `DEBUG` | | `true` — hot reload va batafsil logging yoqiladi |
 | `TEST_MODE` | | `true` — barcha fon sinxron tasklari o'chiriladi |
 
@@ -398,7 +401,7 @@ POST /api/auth/connect/salesdoctor
 | Sikl | Interval | Nima qiladi |
 |---|---|---|
 | Sklad Sinxroni | 60 s | MoySklad dan barcha sklad ma'lumotlarini tortib SD ga yuboradi |
-| Zakaz Sinxroni | 300 s (5 min) | MS dan yangi zakazlarni tortadi (oxirgi 90 kun) → SD ga yuboradi; PENDING zakazlarni qayta urinib ko'radi |
+| Zakaz Sinxroni | 60 s | MS dan yangi zakazlarni tortadi (`INITIAL_ORDER_LOOKBACK_DAYS` orqaga, standart 1 kun) → SD ga yuboradi; PENDING zakazlarni qayta urinib ko'radi. Real-time uchun webhook ishlatiladi |
 | Klient Sinxroni | 300 s (5 min) | Ikki tomonlama klient/kontragent sinxroni |
 | Qarz Sinxroni | 600 s (10 min) | Klient bo'yicha MoySklad dan qarz hisobotlarini tortadi |
 
