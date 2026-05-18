@@ -100,12 +100,19 @@ async def moysklad_webhook(
                         logger.error("Failed to update order status %s: %s", entity_id, e)
 
         elif "counterparty" in entity_type:
-            # Mijoz MS'da yaratildi/yangilandi → SD'ga push
+            # Mijoz MS'da yaratildi/yangilandi → SD'ga push (yangi GPS bilan ham)
             try:
                 if service.ms and action in ("CREATE", "UPDATE"):
+                    # Counterparty fetch without expand returns attributes for free —
+                    # we need them for GPS extraction.
                     cp = await service.ms.get_counterparty(entity_id)
                     cp_name = (cp.get("name") or "").strip()
-                    cp_phone = (cp.get("phone") or "").strip()
+                    # Canonicalize so this counterparty maps to the same local
+                    # row regardless of how the operator typed the phone in MS.
+                    from utils.phone import normalize_phone as _np
+                    cp_phone = _np(cp.get("phone") or "")
+                    address = service._ms_address(cp)
+                    gps = service._extract_gps_from_ms_counterparty(cp)
                     if cp_name:
                         # Local DB ga upsert
                         from sqlalchemy import select as sa_select
@@ -123,21 +130,26 @@ async def moysklad_webhook(
                             service.db.add(local)
                         local.moysklad_id = entity_id
                         local.name = cp_name
-                        local.address = cp.get("actualAddress", "") or local.address
+                        local.address = address or local.address
                         await service.db.commit()
-                        # SD ga push
+                        # SD ga push — agent binding + GPS bilan
                         if service.sd:
                             category = await service._get_sd_category_id("retail")
+                            agent_ref = await service._resolve_agent_for_ms_owner(cp.get("owner"))
                             sd_client = service._build_sd_client(
                                 name=cp_name, phone=cp_phone,
-                                address=cp.get("actualAddress", ""),
+                                address=address,
                                 client_type="retail", category=category,
+                                location=gps, agent=agent_ref,
                             )
                             try:
                                 await service.sd.set_client([sd_client])
                             except Exception as e:
                                 await service.log(LogType.WARNING, "Webhook", f"SD setClient failed: {e}")
-                    await service.log(LogType.SUCCESS, "Webhook", f"Counterparty {action} → SD: {cp_name}")
+                    msg = f"Counterparty {action} → SD: {cp_name}"
+                    if gps:
+                        msg += f" (GPS: {gps})"
+                    await service.log(LogType.SUCCESS, "Webhook", msg)
             except Exception as e:
                 await service.log(LogType.ERROR, "Webhook", f"Counterparty {action} failed: {e}")
 

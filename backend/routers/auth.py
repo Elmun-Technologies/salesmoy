@@ -84,19 +84,32 @@ def _token_response(user: User, tenant: Tenant) -> dict:
     }
 
 
-async def _auto_register_webhooks(tenant: Tenant, db: AsyncSession) -> None:
+async def _auto_register_webhooks(tenant: Tenant, db: AsyncSession) -> dict:
     """Auto-register MoySklad webhooks after a tenant connects their account.
 
-    Silently skips if PUBLIC_BASE_URL is not HTTPS (dev/local environments).
+    Returns a status dict the caller can surface to the operator so they
+    know whether real-time updates are wired or the tenant is on polling-only.
     Never raises — failures are logged but don't block the connection response.
     """
     from services.moysklad import MoySkladClient
 
     cfg = get_settings()
     base = (cfg.public_base_url or "").rstrip("/")
-    if not base or not base.startswith("https://"):
-        logger.info("Skipping auto-webhook registration: PUBLIC_BASE_URL not HTTPS (%s)", base)
-        return
+    if not base:
+        logger.warning(
+            "Webhook auto-registration SKIPPED for tenant %s: PUBLIC_BASE_URL is empty. "
+            "Integration will operate in polling-only mode (60s–600s lag). "
+            "Set PUBLIC_BASE_URL to an HTTPS URL to enable real-time updates.",
+            tenant.id,
+        )
+        return {"status": "skipped", "reason": "PUBLIC_BASE_URL not set", "real_time": False}
+    if not base.startswith("https://"):
+        logger.warning(
+            "Webhook auto-registration SKIPPED for tenant %s: PUBLIC_BASE_URL must be HTTPS "
+            "(got %s). MoySklad requires HTTPS for webhooks. Polling-only mode active.",
+            tenant.id, base,
+        )
+        return {"status": "skipped", "reason": "PUBLIC_BASE_URL must be HTTPS", "real_time": False}
 
     target_url = f"{base}/webhook/moysklad"
     client = MoySkladClient(token=tenant.moysklad_access_token)
@@ -109,14 +122,22 @@ async def _auto_register_webhooks(tenant: Tenant, db: AsyncSession) -> None:
                 await db.commit()
 
         result = await client.ensure_webhooks(target_url)
+        created = len(result.get("created", []))
+        existing = len(result.get("existing", []))
         logger.info(
-            "Auto-webhooks for tenant %s: created=%s existing=%s",
-            tenant.id,
-            len(result.get("created", [])),
-            len(result.get("existing", [])),
+            "Auto-webhooks for tenant %s: created=%s existing=%s target=%s",
+            tenant.id, created, existing, target_url,
         )
+        return {
+            "status": "ok",
+            "real_time": True,
+            "created": created,
+            "existing": existing,
+            "target": target_url,
+        }
     except Exception as e:
         logger.warning("Auto-webhook registration failed for tenant %s: %s", tenant.id, e)
+        return {"status": "error", "reason": str(e), "real_time": False}
     finally:
         await client.close()
 

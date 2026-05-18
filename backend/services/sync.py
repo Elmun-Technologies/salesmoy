@@ -430,7 +430,10 @@ class SyncService:
                 if c.get("code_1C"):
                     continue  # already linked to MS
 
-                phone = (c.get("tel") or "").strip()
+                # Normalize before searching MS — otherwise "+998 90 ..." in SD
+                # silently fails to match "998901234567" in MS and we create a
+                # duplicate MS counterparty for the same human.
+                phone = normalize_phone(c.get("tel") or "")
                 name = (c.get("shortName") or c.get("firmName") or "").strip()
                 if not name and not phone:
                     continue
@@ -836,7 +839,9 @@ class SyncService:
                     continue
 
                 client_block = o.get("client") or {}
-                client_phone = (client_block.get("tel") or "").strip()
+                # Normalize SD's tel to canonical "+998..." before searching MS;
+                # mismatched formatting was creating duplicate MS counterparties.
+                client_phone = normalize_phone(client_block.get("tel") or "")
                 client_name = (client_block.get("shortName") or client_block.get("firmName") or "").strip()
                 client_code_1c = client_block.get("code_1C") or client_phone
 
@@ -860,7 +865,7 @@ class SyncService:
 
                 # Build positions from SD orderProducts
                 positions = []
-                products_invalid = False
+                missing_skus: List[str] = []
                 for p in o.get("orderProducts", []) or []:
                     sku = (p.get("product") or {}).get("code_1C") or p.get("code_1C")
                     qty = p.get("quantity", 1)
@@ -869,15 +874,27 @@ class SyncService:
                         continue
                     ms_product = await self.ms.get_product_by_code(sku)
                     if not ms_product:
-                        products_invalid = True
-                        logger.warning("MS product not found for SKU %s — skip order %s", sku, sd_id)
-                        break
+                        missing_skus.append(sku)
+                        continue
                     positions.append({
                         "quantity": qty,
                         "price": price,
                         "assortment": {"meta": ms_product.get("meta")},
                     })
-                if products_invalid or not positions:
+                # Loud failure mode: if ANY product is missing in MS, log a
+                # structured error so the operator can fix the SKU and the
+                # order can be retried. Silently dropping the order was the
+                # previous behavior and made support cases impossible.
+                if missing_skus:
+                    await self.log(
+                        LogType.ERROR, "Order Sync",
+                        f"SD→MS order {sd_id} skipped: {len(missing_skus)} SKU(s) not in "
+                        f"MoySklad: {', '.join(missing_skus[:5])}"
+                        + (" …" if len(missing_skus) > 5 else "")
+                        + ". Fix code_1C in MoySklad, order will retry on next cycle.",
+                    )
+                    continue
+                if not positions:
                     continue
 
                 order_name = f"SD-{sd_id}"
@@ -1049,7 +1066,7 @@ class SyncService:
 
         try:
             client_name = order_data.get("client_name", "")
-            client_phone = order_data.get("phone", "")
+            client_phone = normalize_phone(order_data.get("phone", ""))
             items = order_data.get("items", [])
 
             # Check monthly order limit
@@ -1061,8 +1078,12 @@ class SyncService:
                     Order.created_at >= current_month
                 )
             )
-            # Find or create counterparty
-            counterparties = await self.ms.get_counterparties(phone=client_phone)
+            # Find or create counterparty — phone is already canonical above,
+            # so this matches the same person across all entry channels.
+            counterparties = (
+                await self.ms.get_counterparties(phone=client_phone)
+                if client_phone else []
+            )
             if counterparties:
                 counterparty = counterparties[0]
             else:
