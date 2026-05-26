@@ -67,7 +67,7 @@ function StatCard({
 }
 
 export default function Dashboard() {
-  const [syncTime, setSyncTime] = useState(new Date());
+  const [syncTime, setSyncTime] = useState<Date | null>(null);
   const [stats, setStats] = useState({
     totalOrders: 0,
     ordersToday: 0,
@@ -85,11 +85,6 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const interval = setInterval(() => setSyncTime(new Date()), 1000);
-    return () => clearInterval(interval);
-  }, []);
-
-  useEffect(() => {
     async function loadData() {
       try {
         const [orders, stock, clients, , logs] = await Promise.all([
@@ -100,8 +95,21 @@ export default function Dashboard() {
           getLogs(),
         ]);
 
-        const today = new Date().toISOString().split('T')[0];
-        const todayOrders = orders.filter((o: any) => o.createdAt?.startsWith(today));
+        // Use the user's local date (not UTC) — for UZ (UTC+5) UTC midnight
+        // happens at 05:00 local, so orders placed before dawn would otherwise
+        // be classified as yesterday.
+        const now = new Date();
+        const isSameLocalDay = (iso?: string) => {
+          if (!iso) return false;
+          const d = new Date(iso);
+          if (Number.isNaN(d.getTime())) return false;
+          return (
+            d.getFullYear() === now.getFullYear() &&
+            d.getMonth() === now.getMonth() &&
+            d.getDate() === now.getDate()
+          );
+        };
+        const todayOrders = orders.filter((o: any) => isSameLocalDay(o.createdAt));
         const revenueToday = todayOrders.reduce((sum: number, o: any) => sum + (o.total || 0), 0);
         const totalRevenue = orders.reduce((sum: number, o: any) => sum + (o.total || 0), 0);
         const lowStock = stock.filter((s: any) => s.qty > 0 && s.qty <= 5).length;
@@ -128,6 +136,17 @@ export default function Dashboard() {
         const agents = Object.entries(agentMap)
           .map(([name, d]) => ({ name, orders: d.orders, revenue: d.revenue, clients: d.clients.size }))
           .sort((a, b) => b.revenue - a.revenue);
+
+        // Real last-sync time: timestamp of the most recent log entry.
+        // Logs are written by every sync loop iteration (success or error),
+        // so this reflects whether the background loop is actually running.
+        const newestLogTs = logs
+          .map((l: any) => l.timestamp)
+          .filter(Boolean)
+          .map((t: string) => new Date(t))
+          .filter((d: Date) => !Number.isNaN(d.getTime()))
+          .sort((a: Date, b: Date) => b.getTime() - a.getTime())[0];
+        setSyncTime(newestLogTs ?? null);
 
         setStats({
           totalOrders: orders.length,
@@ -182,7 +201,9 @@ export default function Dashboard() {
         </div>
         <div className="flex items-center gap-2 text-sm text-slate-500 bg-white px-3 py-2 rounded-lg border border-slate-200">
           <Clock className="w-4 h-4" />
-          Последняя синхронизация: {syncTime.toLocaleTimeString('ru-RU')}
+          {syncTime
+            ? `Последняя синхронизация: ${syncTime.toLocaleString('ru-RU')}`
+            : 'Последняя синхронизация: нет данных'}
         </div>
       </div>
 
