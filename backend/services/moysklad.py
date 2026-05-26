@@ -4,7 +4,7 @@ import logging
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
 from config import get_settings
 
@@ -67,9 +67,11 @@ class MoySkladClient:
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         reraise=True,
-        # Do NOT retry auth failures — `tenacity` shouldn't burn attempts
-        # against a dead token. We handle 401 explicitly inside _request.
-        retry=lambda r: not isinstance(r.outcome.exception(), MoySkladAuthError) if r.outcome else False,
+        # Retry on any exception EXCEPT MoySkladAuthError (dead token shouldn't
+        # burn retry attempts — we handle 401 explicitly inside _request).
+        # Previous lambda also returned True on success, causing tenacity to
+        # loop on healthy 200 responses and surface a spurious RetryError.
+        retry=retry_if_not_exception_type(MoySkladAuthError),
     )
     async def _request(
         self,
