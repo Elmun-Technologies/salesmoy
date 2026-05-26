@@ -40,11 +40,12 @@ class Settings(BaseSettings):
     client_sync_interval: int = 300
     order_sync_interval: int = 60
 
-    # MoySklad-side: how many days back to scan on the first order sync after
-    # restart. After that the system relies on webhooks + the incremental loop.
-    # Set higher (e.g. 7) when migrating an existing tenant; 1 is enough for
-    # steady-state operation.
-    initial_order_lookback_days: int = 1
+    # MoySklad-side: how many days back the incremental order sync scans.
+    # 3 days is a balance — wide enough to absorb a weekend outage of the
+    # webhook channel without missing orders, narrow enough that a normal
+    # tenant's window stays manageable. Webhooks still handle real-time;
+    # this is the safety net that fills any gaps.
+    initial_order_lookback_days: int = 3
 
     # Currency exchange rate (USD to UZS)
     # MoySklad prices are in USD, Sales Doctor expects UZS
