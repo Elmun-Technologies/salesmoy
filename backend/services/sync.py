@@ -595,6 +595,20 @@ class SyncService:
             "Отменен": OrderStatus.CANCELLED,
         }
 
+        # MoySklad's `moment` is the real order time. Without this, created_at
+        # defaults to insertion time and the dashboard's "today" filter shows
+        # stale orders on the day they were imported instead of when they were
+        # actually placed.
+        ms_moment = ms_order.get("moment")
+        order_created_at: Optional[datetime] = None
+        if ms_moment:
+            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    order_created_at = datetime.strptime(ms_moment, fmt)
+                    break
+                except (TypeError, ValueError):
+                    continue
+
         order = Order(
             tenant_id=self.tenant.id,
             order_id=order_name,
@@ -607,8 +621,10 @@ class SyncService:
             status=status_map.get(state_name, OrderStatus.NEW),
             sync_status=SyncStatus.PENDING,
             items=items,
-            raw_data={"source": "moysklad", "state": state_name},
+            raw_data={"source": "moysklad", "state": state_name, "moment": ms_moment},
         )
+        if order_created_at is not None:
+            order.created_at = order_created_at
         self.db.add(order)
 
         # Push to Sales Doctor via setOrder (using exact SD API field names)
@@ -737,6 +753,11 @@ class SyncService:
             if synced > 0:
                 await self.log(LogType.SUCCESS, "Order Sync",
                                f"Synced {synced} new orders from MoySklad")
+            else:
+                # Heartbeat — proves the loop ran even when MS has nothing new.
+                # Powers the dashboard's "last sync time" indicator.
+                await self.log(LogType.INFO, "Order Sync",
+                               f"Polled MoySklad: 0 new orders (scanned last {lookback}d)")
 
             # ── Retry PENDING orders (pushed to DB but never pushed to SD) ──
             # This handles orders that were imported when SD was not configured,
