@@ -131,6 +131,11 @@ async def moysklad_webhook(
                         local.moysklad_id = entity_id
                         local.name = cp_name
                         local.address = address or local.address
+                        # Persist GPS locally too so the dashboard / API
+                        # reflects it without waiting for the next 5-min
+                        # bulk client sync.
+                        if gps:
+                            local.location = gps
                         await service.db.commit()
                         # SD ga push — agent binding + GPS bilan
                         if service.sd:
