@@ -4,6 +4,7 @@ import {
   Shield,
   Key,
   CheckCircle2,
+  Globe,
   Database,
   RefreshCw,
   Building2,
