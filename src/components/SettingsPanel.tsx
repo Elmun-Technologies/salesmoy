@@ -114,7 +114,8 @@ export default function SettingsPanel() {
       setTenant(me.tenant);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
-    } catch (e) {
+    } catch (e: any) {
+      window.alert(e?.message || 'MoySklad ulanishda xatolik');
       console.error(e);
     }
   }
@@ -215,7 +216,7 @@ export default function SettingsPanel() {
             MoySklad Marketplace OAuth orqali ulash
           </button>
           <p className="text-xs text-slate-500">
-            Yoki qo’lda access token kiriting (JSON dagi <code className="bg-slate-100 px-1 rounded">access_token</code>{‘ ‘}
+            Yoki qo'lda access token kiriting (JSON dagi <code className="bg-slate-100 px-1 rounded">access_token</code>{' '}
             qiymati):
           </p>
 
