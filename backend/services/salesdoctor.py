@@ -46,7 +46,10 @@ class SalesDoctorClient:
         self.user_id = user_id
         self.token = token
         self.filial_id = filial_id
-        self._http = httpx.AsyncClient(timeout=30.0, headers=self.HEADERS)
+        # Sales Doctor's TLS cert (api.salesdoctor.uz) is misconfigured — hostname
+        # mismatch trips Python's SSL verification. Skip verification so the
+        # integration can talk to the upstream; revisit if/when SD fixes their cert.
+        self._http = httpx.AsyncClient(timeout=30.0, headers=self.HEADERS, verify=False)
 
     async def close(self):
         await self._http.aclose()
@@ -128,7 +131,7 @@ class SalesDoctorClient:
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0 (compatible; SalesMoy-Integration/1.0)",
         }
-        async with httpx.AsyncClient(timeout=30.0) as http:
+        async with httpx.AsyncClient(timeout=30.0, verify=False) as http:
             try:
                 resp = await http.post(url, json=payload, headers=headers)
                 resp.raise_for_status()
