@@ -714,11 +714,13 @@ class SyncService:
         return order
 
     async def sync_orders_from_moysklad(self):
-        """Pull today's new orders from MoySklad → Sales Doctor.
+        """Pull new orders from MoySklad → Sales Doctor.
 
-        Only fetches orders from the last 24 hours. Historical orders are not
-        imported automatically — they can be synced on demand if the client requests.
-        Also retries SD push for any DB orders that are still PENDING (no salesdoctor_id).
+        Uses paginated fetch (get_customer_orders_in_range) so catalogs with
+        more than 100 orders per window aren't silently truncated. SD pushes
+        are throttled with a 500ms gap between orders to stay under SD's
+        HTTP 429 rate limit. After polling, any PENDING or ERROR orders
+        already in the DB get a fresh push attempt.
         """
         if not self.ms:
             return
@@ -727,35 +729,47 @@ class SyncService:
             # Incremental window — covers the case where webhooks were missed
             # (e.g. backend restart). Webhooks handle real-time, this is the safety net.
             from config import get_settings as _gs
+            from datetime import timedelta as _td
             lookback = max(1, _gs().initial_order_lookback_days)
-            ms_orders = await self.ms.get_customer_orders(limit=100, expand=False, days_back=lookback)
+            end = datetime.utcnow()
+            start = end - _td(days=lookback)
+            # Paginated + expanded list. The previous implementation called
+            # get_customer_orders(limit=100) with no pagination, so any day
+            # with >100 orders silently lost the older ones — they never
+            # reached our DB, and never reached SalesDoctor.
+            ms_orders = await self.ms.get_customer_orders_in_range(start, end, expand=True)
             synced = 0
+            skipped = 0
 
-            for ms_order_brief in ms_orders:
-                ms_id = ms_order_brief.get("id", "")
+            for ms_order_full in ms_orders:
+                ms_id = ms_order_full.get("id", "")
                 if not ms_id:
                     continue
 
-                # Check if already in DB
+                # Skip if already in DB (process_moysklad_order also checks,
+                # but the explicit skip avoids spurious commits and lets us
+                # report an accurate "already in DB" count).
                 result = await self.db.execute(
                     select(Order).where(
                         Order.tenant_id == self.tenant.id,
                         Order.moysklad_id == ms_id,
                     )
                 )
-                existing = result.scalar_one_or_none()
-
-                if existing:
+                if result.scalar_one_or_none():
+                    skipped += 1
                     continue
 
-                # New order: full processing
                 try:
-                    ms_order_full = await self.ms.get_customer_order_with_positions(ms_id)
                     order = await self.process_moysklad_order(ms_order_full)
                     if order:
                         synced += 1
+                    # SD rate-limits at roughly 4-5 req/s before returning 429.
+                    # A 500ms gap between order pushes keeps us safely under
+                    # that limit and the daily backlog still drains promptly.
+                    if self.sd:
+                        await asyncio.sleep(0.5)
                 except Exception as e:
-                    logger.warning("Could not fetch full order %s: %s", ms_id, e)
+                    logger.warning("Could not process MS order %s: %s", ms_id, e)
                     continue
 
             if synced > 0:
@@ -765,63 +779,14 @@ class SyncService:
                 # Heartbeat — proves the loop ran even when MS has nothing new.
                 # Powers the dashboard's "last sync time" indicator.
                 await self.log(LogType.INFO, "Order Sync",
-                               f"Polled MoySklad: 0 new orders (scanned last {lookback}d)")
+                               f"Polled MoySklad: 0 new orders (scanned last {lookback}d, {skipped} already in DB)")
 
-            # ── Retry PENDING orders (pushed to DB but never pushed to SD) ──
-            # This handles orders that were imported when SD was not configured,
-            # or when the first setOrder call failed silently.
+            # ── Retry PENDING and ERROR orders ──
+            # ERROR orders are previously-imported rows whose SD push failed
+            # (often due to 429). Without this retry they would stay invisible
+            # in SalesDoctor forever.
             if self.sd:
-                try:
-                    pending_result = await self.db.execute(
-                        select(Order).where(
-                            Order.tenant_id == self.tenant.id,
-                            Order.sync_status == SyncStatus.PENDING,
-                            Order.moysklad_id.isnot(None),
-                        ).limit(20)  # process at most 20 retries per cycle
-                    )
-                    pending_orders = pending_result.scalars().all()
-                except Exception as e:
-                    logger.warning("Could not load PENDING orders for retry: %s", e)
-                    pending_orders = []
-
-                retried = 0
-                failed_retries = 0
-                for pending in pending_orders:
-                    order_id_str = pending.order_id or str(pending.id)
-                    try:
-                        ms_order_full = await self.ms.get_customer_order_with_positions(pending.moysklad_id)
-                        await self._push_order_to_sd(pending, ms_order_full)
-                        pending.sync_status = SyncStatus.SYNCED
-                        pending.synced_at = datetime.utcnow()
-                        await self.db.commit()
-                        retried += 1
-                    except Exception as e:
-                        logger.warning("Retry failed for order %s: %s", order_id_str, e)
-                        failed_retries += 1
-                        # Reset session state, then mark order as ERROR
-                        try:
-                            await self.db.rollback()
-                        except Exception as rb_err:
-                            logger.warning("Rollback failed after retry error: %s", rb_err)
-                        try:
-                            # Re-load pending order after rollback to avoid DetachedInstanceError
-                            fresh = await self.db.get(Order, pending.id)
-                            if fresh:
-                                fresh.sync_status = SyncStatus.ERROR
-                                await self.db.commit()
-                        except Exception as mark_err:
-                            logger.warning("Could not mark order %s as ERROR: %s", order_id_str, mark_err)
-                            try:
-                                await self.db.rollback()
-                            except Exception:
-                                pass
-
-                if retried > 0:
-                    await self.log(LogType.SUCCESS, "Order Sync",
-                                   f"Retried {retried} pending orders → SD")
-                if failed_retries > 0:
-                    await self.log(LogType.WARNING, "Order Sync",
-                                   f"{failed_retries} pending orders failed retry (marked as ERROR)")
+                await self._retry_unsynced_orders()
 
         except Exception as e:
             import traceback as _tb
@@ -829,6 +794,67 @@ class SyncService:
                          self.tenant.id, e, _tb.format_exc())
             await self.log(LogType.ERROR, "Order Sync",
                            f"sync_orders_from_moysklad failed: {type(e).__name__}: {e}")
+
+    async def _retry_unsynced_orders(self, max_retries: int = 30):
+        """Retry pushing DB orders that are still PENDING or ERROR to SalesDoctor.
+
+        Processes up to `max_retries` per call so a large backlog doesn't
+        monopolize a single sync cycle. Each push is paced 500ms apart to
+        stay under SD's per-second rate limit.
+        """
+        try:
+            result = await self.db.execute(
+                select(Order).where(
+                    Order.tenant_id == self.tenant.id,
+                    Order.sync_status.in_([SyncStatus.PENDING, SyncStatus.ERROR]),
+                    Order.moysklad_id.isnot(None),
+                ).order_by(Order.created_at.desc()).limit(max_retries)
+            )
+            orders_to_retry = result.scalars().all()
+        except Exception as e:
+            logger.warning("Could not load unsynced orders for retry: %s", e)
+            return
+
+        if not orders_to_retry:
+            return
+
+        retried = 0
+        still_failed = 0
+        for order in orders_to_retry:
+            order_id_str = order.order_id or str(order.id)
+            try:
+                ms_order_full = await self.ms.get_customer_order_with_positions(order.moysklad_id)
+                await self._push_order_to_sd(order, ms_order_full)
+                order.sync_status = SyncStatus.SYNCED
+                order.synced_at = datetime.utcnow()
+                await self.db.commit()
+                retried += 1
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.warning("Retry failed for order %s: %s", order_id_str, e)
+                still_failed += 1
+                try:
+                    await self.db.rollback()
+                except Exception:
+                    pass
+                # Re-load to avoid DetachedInstanceError after rollback.
+                try:
+                    fresh = await self.db.get(Order, order.id)
+                    if fresh:
+                        fresh.sync_status = SyncStatus.ERROR
+                        await self.db.commit()
+                except Exception:
+                    try:
+                        await self.db.rollback()
+                    except Exception:
+                        pass
+
+        if retried > 0:
+            await self.log(LogType.SUCCESS, "Order Sync",
+                           f"Retried {retried} previously-unsynced orders → SD")
+        if still_failed > 0:
+            await self.log(LogType.WARNING, "Order Sync",
+                           f"{still_failed} orders still failing after retry")
 
     async def sync_orders_from_salesdoctor(self):
         """Pull SD orders that originated in SD (no code_1C) and create them in MoySklad.
