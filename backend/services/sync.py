@@ -310,6 +310,12 @@ class SyncService:
                 phone = normalize_phone(cp.get("phone", ""))
                 name = cp.get("name", "").strip()
                 ms_id = cp.get("id", "")
+                # Pull address + GPS once so all branches below stay consistent.
+                # Without this, only NEW client rows ever got these fields —
+                # any client that already existed (matched by phone/name) kept
+                # whatever address it had been imported with (often empty).
+                ms_address = self._ms_address(cp)
+                ms_gps = self._extract_gps_from_ms_counterparty(cp)
 
                 if not name:
                     continue
@@ -343,16 +349,28 @@ class SyncService:
                     by_name.merged_into_id = by_phone.id
                     by_phone.moysklad_id = ms_id
                     by_phone.name = name
+                    if ms_address:
+                        by_phone.address = ms_address
+                    if ms_gps:
+                        by_phone.location = ms_gps
                     merged += 1
 
                 elif by_phone:
                     by_phone.moysklad_id = ms_id
                     by_phone.name = name
+                    if ms_address:
+                        by_phone.address = ms_address
+                    if ms_gps:
+                        by_phone.location = ms_gps
 
                 elif by_name:
                     by_name.moysklad_id = ms_id
                     if phone:
                         by_name.phone = phone
+                    if ms_address:
+                        by_name.address = ms_address
+                    if ms_gps:
+                        by_name.location = ms_gps
 
                 else:
                     # New client
@@ -361,7 +379,8 @@ class SyncService:
                         moysklad_id=ms_id,
                         name=name,
                         phone=phone,
-                        address=self._ms_address(cp),
+                        address=ms_address,
+                        location=ms_gps,
                         client_type=ClientType.RETAIL,
                         is_duplicate=False,
                     )
@@ -388,6 +407,7 @@ class SyncService:
                             name=cp_name,
                             phone=cp_phone,
                             address=self._ms_address(cp),
+                            location=self._extract_gps_from_ms_counterparty(cp),
                             client_type="retail",
                             category=category,
                             agent=agent_ref,
@@ -629,7 +649,14 @@ class SyncService:
             status=status_map.get(state_name, OrderStatus.NEW),
             sync_status=SyncStatus.PENDING,
             items=items,
-            raw_data={"source": "moysklad", "state": state_name, "moment": ms_moment},
+            raw_data={
+                "source": "moysklad",
+                "state": state_name,
+                "moment": ms_moment,
+                # Persist the delivery address so operators can audit what
+                # was sent to SD even if the agent record changes later.
+                "shipmentAddress": delivery_address or None,
+            },
         )
         if order_created_at is not None:
             order.created_at = order_created_at
