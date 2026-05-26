@@ -306,13 +306,79 @@ async def root():
 @app.get("/health")
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint."""
+    """Health check endpoint with sync-freshness signal.
+
+    Reports:
+      - api / database: process and DB are responsive
+      - tenants: how many connected and how many have stale syncs
+
+    A tenant is "stale" if its `last_successful_sync_at` is older than
+    SYNC_STALE_AFTER_MINUTES (default 10 min). Stale tenants surface in
+    the response so an external monitor (uptime check, alert rule) can
+    catch credentials going bad without waiting for the customer to
+    notice missing data.
+    """
+    from datetime import timedelta
+    from sqlalchemy import select, func
+    from database import AsyncSessionLocal
+    from models import Tenant
+
+    stale_minutes = int(os.getenv("SYNC_STALE_AFTER_MINUTES", "10"))
+    now = datetime.utcnow()
+    cutoff = now - timedelta(minutes=stale_minutes)
+
+    db_ok = True
+    total = 0
+    connected = 0
+    stale: list[dict] = []
+    try:
+        async with AsyncSessionLocal() as db:
+            total = (await db.execute(
+                select(func.count()).select_from(Tenant).where(Tenant.is_active == True)
+            )).scalar() or 0
+            connected = (await db.execute(
+                select(func.count()).select_from(Tenant).where(
+                    Tenant.is_active == True,
+                    Tenant.moysklad_access_token.is_not(None),
+                    Tenant.salesdoctor_token.is_not(None),
+                )
+            )).scalar() or 0
+            stale_rows = (await db.execute(
+                select(Tenant.id, Tenant.slug, Tenant.last_successful_sync_at).where(
+                    Tenant.is_active == True,
+                    Tenant.moysklad_access_token.is_not(None),
+                    Tenant.salesdoctor_token.is_not(None),
+                    (Tenant.last_successful_sync_at.is_(None))
+                    | (Tenant.last_successful_sync_at < cutoff),
+                )
+            )).all()
+            stale = [
+                {
+                    "id": r[0],
+                    "slug": r[1],
+                    "last_successful_sync_at": r[2].isoformat() if r[2] else None,
+                }
+                for r in stale_rows
+            ]
+    except Exception as e:
+        db_ok = False
+        logger.error(f"Health check DB query failed: {e}")
+
+    overall = "healthy" if db_ok and not stale else ("degraded" if db_ok else "unhealthy")
+
     return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
+        "status": overall,
+        "timestamp": now.isoformat(),
         "services": {
             "api": "ok",
-            "database": "ok",
+            "database": "ok" if db_ok else "error",
+        },
+        "tenants": {
+            "active": total,
+            "fully_connected": connected,
+            "stale_count": len(stale),
+            "stale_after_minutes": stale_minutes,
+            "stale": stale[:20],
         },
     }
 

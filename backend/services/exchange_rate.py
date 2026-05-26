@@ -8,8 +8,12 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# In-memory cache: {date_str: rate}
+# In-memory cache: rate + when it was last fetched from a live source.
 _rate_cache: dict = {}
+_last_live_fetch_at: Optional[datetime] = None
+# After this many hours without a live fetch, every fallback log gets
+# escalated to ERROR so it's clearly visible an operator should intervene.
+_STALE_FALLBACK_HOURS = 24
 
 
 async def get_usd_to_uzs_rate() -> float:
@@ -22,6 +26,7 @@ async def get_usd_to_uzs_rate() -> float:
 
     Caches rate per day to minimize API calls.
     """
+    global _last_live_fetch_at
     today = datetime.utcnow().date().isoformat()
 
     # Return cached rate if available
@@ -31,13 +36,30 @@ async def get_usd_to_uzs_rate() -> float:
     rate = await _fetch_cbr_rate() or await _fetch_uzex_rate()
     if rate:
         _rate_cache[today] = rate
+        _last_live_fetch_at = datetime.utcnow()
         logger.info(f"Exchange rate USD→UZS: {rate}")
         return rate
 
     # Fall back to config default
     from config import get_settings
     default_rate = get_settings().usd_to_uzs_rate
-    logger.warning(f"Could not fetch exchange rate, using default: {default_rate}")
+    stale_for = None
+    if _last_live_fetch_at is not None:
+        stale_for = datetime.utcnow() - _last_live_fetch_at
+    if stale_for is None or stale_for >= timedelta(hours=_STALE_FALLBACK_HOURS):
+        logger.error(
+            "Exchange rate sources unavailable; using hardcoded fallback %s. "
+            "Last successful fetch: %s. UPDATE usd_to_uzs_rate in config or fix "
+            "CBR/UZEX connectivity — order totals are being computed with a "
+            "potentially stale rate.",
+            default_rate,
+            _last_live_fetch_at.isoformat() if _last_live_fetch_at else "never",
+        )
+    else:
+        logger.warning(
+            "Exchange rate sources unavailable; using fallback %s (last live fetch %s ago)",
+            default_rate, stale_for,
+        )
     _rate_cache[today] = default_rate
     return default_rate
 
