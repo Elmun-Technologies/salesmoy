@@ -1,5 +1,7 @@
 """Order API endpoints (Tenant-aware)."""
 
+import os
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -9,6 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
 from models import Order, OrderStatus, SyncStatus, SyncLog, LogType, Tenant
 from services.sync import SyncService
+from services.exchange_rate import get_usd_to_uzs_rate
+from utils.currency import convert_moysklad_price_to_uzs
 
 router = APIRouter(prefix="/api/orders", tags=["Orders"])
 
@@ -66,6 +70,81 @@ async def get_orders(
         }
         for o in orders
     ]
+
+
+@router.get("/by-date")
+async def get_orders_by_date(
+    request: Request,
+    date: str = Query(..., description="YYYY-MM-DD, interpreted in account local time"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Fetch a day's orders directly from MoySklad. Does NOT persist to DB.
+
+    Use this for any historical date the dashboard wants to display — the
+    background sync only keeps the recent window, so older days come from
+    MoySklad live on demand.
+    """
+    tenant_id = get_tenant_id(request)
+    result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
+    tenant = result.scalar_one()
+
+    try:
+        day = datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date, expected YYYY-MM-DD")
+
+    start = day
+    end = day + timedelta(days=1)
+
+    service = SyncService(db, tenant)
+    await service.init_clients()
+    if not service.ms:
+        raise HTTPException(status_code=400, detail="MoySklad credentials not configured")
+
+    ms_orders = await service.ms.get_customer_orders_in_range(start, end, expand=True)
+
+    rate = await get_usd_to_uzs_rate()
+    force_currency = (
+        SyncService._default_price_currency.get(tenant.id)
+        or os.getenv("FORCE_PRICE_CURRENCY", "USD")
+    ).upper()
+
+    out: List[dict] = []
+    total_revenue = 0
+    for o in ms_orders:
+        currency = force_currency
+        total = convert_moysklad_price_to_uzs(o.get("sum", 0), currency, rate)
+        total_revenue += total
+        agent = o.get("agent") if isinstance(o.get("agent"), dict) else {}
+        state = o.get("state") if isinstance(o.get("state"), dict) else {}
+        items: List[dict] = []
+        positions = o.get("positions") if isinstance(o.get("positions"), dict) else {}
+        for pos in positions.get("rows", []) if positions else []:
+            a = pos.get("assortment") if isinstance(pos.get("assortment"), dict) else {}
+            items.append({
+                "name": a.get("name", ""),
+                "sku": a.get("code", ""),
+                "qty": pos.get("quantity", 1),
+                "price": convert_moysklad_price_to_uzs(pos.get("price", 0), currency, rate),
+            })
+        out.append({
+            "id": o.get("name") or (o.get("id", "")[:8]),
+            "moyskladId": o.get("id"),
+            "clientName": agent.get("name", "") if agent else "",
+            "phone": (agent.get("phone") or agent.get("actualPhone") or "") if agent else "",
+            "agentName": "MoySklad",
+            "total": total,
+            "status": state.get("name", "Новый") if state else "Новый",
+            "createdAt": o.get("moment"),
+            "items": items,
+        })
+
+    return {
+        "date": date,
+        "ordersCount": len(out),
+        "totalRevenue": total_revenue,
+        "orders": out,
+    }
 
 
 @router.get("/{order_id}")

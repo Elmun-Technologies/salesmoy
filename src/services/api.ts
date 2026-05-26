@@ -184,6 +184,17 @@ export const getOrders = (params?: string) =>
     () => mock.mockGetOrders()
   );
 
+export const getOrdersByDate = (date: string) =>
+  withFallback(
+    () => fetchJson(`/api/orders/by-date?date=${encodeURIComponent(date)}`),
+    () =>
+      mock.mockGetOrders().then((orders: any[]) => {
+        const sameDay = orders.filter((o) => (o.createdAt || '').startsWith(date));
+        const totalRevenue = sameDay.reduce((s, o) => s + (o.total || 0), 0);
+        return { date, ordersCount: sameDay.length, totalRevenue, orders: sameDay };
+      })
+  );
+
 export const getOrder = (id: string) =>
   withFallback(
     () => fetchJson(`/api/orders/${id}`),

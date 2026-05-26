@@ -256,6 +256,39 @@ class MoySkladClient:
         data = await self._request("GET", "/entity/customerorder", params=params)
         return data.get("rows", [])
 
+    async def get_customer_orders_in_range(
+        self,
+        start: "datetime",
+        end: "datetime",
+        expand: bool = True,
+    ) -> List[Dict]:
+        """Fetch all orders with moment in [start, end). Paginates through all pages.
+
+        MoySklad's `moment` filter uses the account's local time (no timezone).
+        Caller is responsible for passing the right boundaries.
+        """
+        s = start.strftime("%Y-%m-%d %H:%M:%S")
+        e = end.strftime("%Y-%m-%d %H:%M:%S")
+        all_rows: List[Dict] = []
+        offset = 0
+        limit = 1000
+        while True:
+            params: Dict[str, Any] = {
+                "limit": limit,
+                "offset": offset,
+                "filter": f"moment>={s};moment<{e}",
+            }
+            if expand:
+                params["expand"] = "agent,state,positions.assortment,rate.currency"
+            data = await self._request("GET", "/entity/customerorder", params=params)
+            rows = data.get("rows", [])
+            all_rows.extend(rows)
+            total = data.get("meta", {}).get("size", 0)
+            offset += len(rows)
+            if not rows or offset >= total:
+                break
+        return all_rows
+
     async def get_customer_order(self, order_id: str) -> Dict:
         """Get single customer order."""
         return await self._request("GET", f"/entity/customerorder/{order_id}")
