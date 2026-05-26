@@ -22,7 +22,14 @@ import {
   Pie,
   Cell,
 } from 'recharts';
-import { getOrders, getStock, getClients, getDebts, getLogs } from '../services/api';
+import { getOrders, getStock, getClients, getDebts, getLogs, getOrdersByDate } from '../services/api';
+
+function localDateString(d: Date) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
 
 const COLORS = ['#10b981', '#3b82f6', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4'];
 
@@ -68,6 +75,13 @@ function StatCard({
 
 export default function Dashboard() {
   const [syncTime, setSyncTime] = useState<Date | null>(null);
+  const [selectedDate, setSelectedDate] = useState<string>(localDateString(new Date()));
+  const [dateStats, setDateStats] = useState<{ ordersCount: number; totalRevenue: number; loading: boolean; error: string | null }>({
+    ordersCount: 0,
+    totalRevenue: 0,
+    loading: false,
+    error: null,
+  });
   const [stats, setStats] = useState({
     totalOrders: 0,
     ordersToday: 0,
@@ -83,6 +97,36 @@ export default function Dashboard() {
   const [agentSales, setAgentSales] = useState<any[]>([]);
   const [monthlyRevenue, setMonthlyRevenue] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+
+  // Whenever the user picks a date, fetch that day's orders live from MoySklad.
+  // No DB write — pure pass-through, so any historical day works even if it's
+  // outside the sync's recent window.
+  useEffect(() => {
+    let cancelled = false;
+    setDateStats((s) => ({ ...s, loading: true, error: null }));
+    getOrdersByDate(selectedDate)
+      .then((res: any) => {
+        if (cancelled) return;
+        setDateStats({
+          ordersCount: res?.ordersCount ?? 0,
+          totalRevenue: res?.totalRevenue ?? 0,
+          loading: false,
+          error: null,
+        });
+      })
+      .catch((e: any) => {
+        if (cancelled) return;
+        setDateStats({
+          ordersCount: 0,
+          totalRevenue: 0,
+          loading: false,
+          error: e?.message || 'Yuklab bo\'lmadi',
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedDate]);
 
   useEffect(() => {
     async function loadData() {
@@ -192,35 +236,51 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
           <h2 className="text-2xl font-bold text-slate-900">Дашборд интеграции</h2>
           <p className="text-slate-500 text-sm mt-1">
             Обзор синхронизации Sales Doctor ↔ MoySklad
           </p>
         </div>
-        <div className="flex items-center gap-2 text-sm text-slate-500 bg-white px-3 py-2 rounded-lg border border-slate-200">
-          <Clock className="w-4 h-4" />
-          {syncTime
-            ? `Последняя синхронизация: ${syncTime.toLocaleString('ru-RU')}`
-            : 'Последняя синхронизация: нет данных'}
+        <div className="flex items-center gap-3 flex-wrap">
+          <div className="flex items-center gap-2 text-sm bg-white px-3 py-2 rounded-lg border border-slate-200">
+            <label htmlFor="dashboard-date" className="text-slate-500">Sana:</label>
+            <input
+              id="dashboard-date"
+              type="date"
+              value={selectedDate}
+              max={localDateString(new Date())}
+              onChange={(e) => setSelectedDate(e.target.value)}
+              className="bg-transparent outline-none text-slate-900 font-medium"
+            />
+            {dateStats.loading && (
+              <RefreshCw className="w-3.5 h-3.5 text-slate-400 animate-spin" />
+            )}
+          </div>
+          <div className="flex items-center gap-2 text-sm text-slate-500 bg-white px-3 py-2 rounded-lg border border-slate-200">
+            <Clock className="w-4 h-4" />
+            {syncTime
+              ? `Последняя синхронизация: ${syncTime.toLocaleString('ru-RU')}`
+              : 'Последняя синхронизация: нет данных'}
+          </div>
         </div>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard
           icon={ShoppingCart}
-          label="Заказов сегодня"
-          value={String(stats.ordersToday)}
-          sub={`Всего: ${stats.totalOrders}`}
+          label={`Заказов (${selectedDate})`}
+          value={dateStats.error ? '—' : String(dateStats.ordersCount)}
+          sub={dateStats.error ? dateStats.error : `Всего в системе: ${stats.totalOrders}`}
           color="bg-emerald-500"
           delay={0}
         />
         <StatCard
           icon={TrendingUp}
-          label="Выручка сегодня"
-          value={`${formatMoney(stats.revenueToday)} сум`}
-          sub={`Всего: ${formatMoney(stats.totalRevenue)} сум`}
+          label={`Выручка (${selectedDate})`}
+          value={dateStats.error ? '—' : `${formatMoney(dateStats.totalRevenue)} сум`}
+          sub={dateStats.error ? 'MoySklad bilan bog\'lana olmadi' : `Всего: ${formatMoney(stats.totalRevenue)} сум`}
           color="bg-blue-500"
           delay={0.1}
         />

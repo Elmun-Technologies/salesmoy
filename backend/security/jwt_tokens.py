@@ -1,4 +1,4 @@
-"""JWT access tokens for API authentication (MoySklad marketplace app backend)."""
+"""JWT access tokens for API authentication."""
 
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -44,25 +44,3 @@ def create_access_token(
 def decode_access_token(token: str) -> Dict[str, Any]:
     settings = get_settings()
     return jwt.decode(token, _secret(), algorithms=[settings.jwt_algorithm])
-
-
-def create_moysklad_oauth_state_token(tenant_id: int) -> str:
-    """Short-lived JWT used as MoySklad OAuth `state` parameter."""
-    settings = get_settings()
-    now = datetime.now(timezone.utc)
-    delta = timedelta(minutes=settings.moysklad_oauth_state_expire_minutes)
-    payload: Dict[str, Any] = {
-        "tid": tenant_id,
-        "purpose": "moysklad_oauth",
-        "iat": int(now.timestamp()),
-        "exp": int((now + delta).timestamp()),
-    }
-    return jwt.encode(payload, _secret(), algorithm=settings.jwt_algorithm)
-
-
-def decode_moysklad_oauth_state_token(token: str) -> int:
-    settings = get_settings()
-    data = jwt.decode(token, _secret(), algorithms=[settings.jwt_algorithm])
-    if data.get("purpose") != "moysklad_oauth" or "tid" not in data:
-        raise jwt.InvalidTokenError("Invalid OAuth state")
-    return int(data["tid"])

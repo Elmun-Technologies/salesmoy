@@ -51,10 +51,26 @@ async def _patch_schema():
                     "salesdoctor_user_id": "VARCHAR(100)",
                     "salesdoctor_token": "TEXT",
                     "salesdoctor_filial_id": "INTEGER DEFAULT 0",
+                    "salesdoctor_token_obtained_at": "DATETIME",
+                    "last_successful_sync_at": "DATETIME",
                 }
                 for col, col_type in new_cols.items():
                     if col not in tenant_cols:
                         await conn.execute(text(f"ALTER TABLE tenants ADD COLUMN {col} {col_type}"))
+
+            # Dedup orders by (tenant_id, moysklad_id) before applying the
+            # unique index — keeping the most recent row wins.
+            await conn.execute(text(
+                "DELETE FROM orders WHERE id NOT IN ("
+                "  SELECT MAX(id) FROM orders"
+                "  WHERE moysklad_id IS NOT NULL"
+                "  GROUP BY tenant_id, moysklad_id"
+                ") AND moysklad_id IS NOT NULL"
+            ))
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_orders_tenant_ms_id "
+                "ON orders (tenant_id, moysklad_id)"
+            ))
 
         elif dialect == "postgresql":
             await conn.execute(
@@ -67,11 +83,26 @@ async def _patch_schema():
                 "salesdoctor_user_id": "VARCHAR(100)",
                 "salesdoctor_token": "TEXT",
                 "salesdoctor_filial_id": "INTEGER DEFAULT 0",
+                "salesdoctor_token_obtained_at": "TIMESTAMP",
+                "last_successful_sync_at": "TIMESTAMP",
             }
             for col, col_type in pg_new.items():
                 await conn.execute(
                     text(f"ALTER TABLE tenants ADD COLUMN IF NOT EXISTS {col} {col_type}")
                 )
+            await conn.execute(text(
+                "DELETE FROM orders WHERE id IN ("
+                "  SELECT id FROM ("
+                "    SELECT id, ROW_NUMBER() OVER ("
+                "      PARTITION BY tenant_id, moysklad_id ORDER BY id DESC"
+                "    ) AS rn FROM orders WHERE moysklad_id IS NOT NULL"
+                "  ) t WHERE rn > 1"
+                ")"
+            ))
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_orders_tenant_ms_id "
+                "ON orders (tenant_id, moysklad_id)"
+            ))
 
 
 async def init_db():

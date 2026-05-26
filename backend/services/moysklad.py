@@ -1,7 +1,7 @@
-"""MoySklad API client with retry logic, error handling, and token refresh."""
+"""MoySklad API client with retry logic and clear auth-error reporting."""
 
 import logging
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
@@ -18,32 +18,21 @@ class MoySkladError(Exception):
 
 
 class MoySkladAuthError(MoySkladError):
-    """Raised when MoySklad rejects the token (401) and refresh isn't possible."""
+    """Raised when MoySklad rejects the token (401). The operator must paste
+    a fresh permanent token from MoySklad → Settings → Access tokens."""
     pass
 
 
-# Callback signature: () -> new_access_token | None
-# Returning None means "refresh failed — give up on this request".
-RefreshCallback = Callable[[], Awaitable[Optional[str]]]
-
-
 class MoySkladClient:
-    """HTTP client for MoySklad API.
+    """HTTP client for MoySklad API using a permanent access token.
 
-    On HTTP 401 the client invokes `refresh_callback` (if supplied) to obtain
-    a new access token, replaces its Authorization header, and replays the
-    request ONCE. The callback is responsible for persisting the new token
-    to the database; this class only updates its own in-memory header.
+    On HTTP 401 the client surfaces a non-retryable MoySkladAuthError so the
+    caller can prompt the operator to update the stored token.
     """
 
-    def __init__(
-        self,
-        token: str = "",
-        refresh_callback: Optional[RefreshCallback] = None,
-    ):
+    def __init__(self, token: str = ""):
         self.base_url = settings.moysklad_base_url
         self.token = token or settings.moysklad_token
-        self.refresh_callback = refresh_callback
         self.headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
@@ -58,19 +47,11 @@ class MoySkladClient:
     async def close(self):
         await self.client.aclose()
 
-    def _apply_token(self, new_token: str) -> None:
-        """Swap the in-memory token after a successful refresh."""
-        self.token = new_token
-        self.client.headers["Authorization"] = f"Bearer {new_token}"
-
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         reraise=True,
-        # Retry on any exception EXCEPT MoySkladAuthError (dead token shouldn't
-        # burn retry attempts — we handle 401 explicitly inside _request).
-        # Previous lambda also returned True on success, causing tenacity to
-        # loop on healthy 200 responses and surface a spurious RetryError.
+        # Dead-token errors shouldn't burn retry attempts.
         retry=retry_if_not_exception_type(MoySkladAuthError),
     )
     async def _request(
@@ -79,9 +60,8 @@ class MoySkladClient:
         endpoint: str,
         json_data: Optional[Dict] = None,
         params: Optional[Dict] = None,
-        _is_retry_after_refresh: bool = False,
     ) -> Dict[str, Any]:
-        """Make HTTP request with retry logic and one-shot token refresh on 401."""
+        """Make HTTP request with retry logic. 401 raises MoySkladAuthError."""
         try:
             response = await self.client.request(
                 method=method,
@@ -94,31 +74,12 @@ class MoySkladClient:
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
             body = e.response.text
-            # ---- 401: try one token refresh, then replay once ----
-            if status == 401 and self.refresh_callback and not _is_retry_after_refresh:
-                logger.warning("MoySklad 401 — attempting token refresh")
-                try:
-                    new_token = await self.refresh_callback()
-                except Exception as refresh_err:
-                    logger.error("MoySklad token refresh raised: %s", refresh_err)
-                    new_token = None
-                if new_token:
-                    self._apply_token(new_token)
-                    logger.info("MoySklad token refreshed — replaying request")
-                    return await self._request(
-                        method, endpoint, json_data=json_data, params=params,
-                        _is_retry_after_refresh=True,
-                    )
-                # Refresh failed — surface a distinct error so tenacity doesn't retry
-                logger.error("MoySklad token refresh failed — credential update required")
-                raise MoySkladAuthError(
-                    f"MoySklad token expired and refresh failed. Re-authorize "
-                    f"the tenant. Original: HTTP {status}: {body}"
-                )
             if status == 401:
-                # No refresh callback configured — surface a clear, non-retryable error
-                logger.error("MoySklad HTTP 401 (no refresh configured): %s", body)
-                raise MoySkladAuthError(f"HTTP 401: {body}")
+                logger.error("MoySklad HTTP 401 — token rejected: %s", body)
+                raise MoySkladAuthError(
+                    f"MoySklad token rejected (HTTP 401). Paste a new permanent "
+                    f"token in Settings. Original body: {body}"
+                )
             logger.error(f"MoySklad HTTP error {status}: {body}")
             raise MoySkladError(f"HTTP {status}: {body}")
         except httpx.RequestError as e:
@@ -255,6 +216,39 @@ class MoySkladClient:
             params["expand"] = "agent,state,positions"
         data = await self._request("GET", "/entity/customerorder", params=params)
         return data.get("rows", [])
+
+    async def get_customer_orders_in_range(
+        self,
+        start: "datetime",
+        end: "datetime",
+        expand: bool = True,
+    ) -> List[Dict]:
+        """Fetch all orders with moment in [start, end). Paginates through all pages.
+
+        MoySklad's `moment` filter uses the account's local time (no timezone).
+        Caller is responsible for passing the right boundaries.
+        """
+        s = start.strftime("%Y-%m-%d %H:%M:%S")
+        e = end.strftime("%Y-%m-%d %H:%M:%S")
+        all_rows: List[Dict] = []
+        offset = 0
+        limit = 1000
+        while True:
+            params: Dict[str, Any] = {
+                "limit": limit,
+                "offset": offset,
+                "filter": f"moment>={s};moment<{e}",
+            }
+            if expand:
+                params["expand"] = "agent,state,positions.assortment,rate.currency"
+            data = await self._request("GET", "/entity/customerorder", params=params)
+            rows = data.get("rows", [])
+            all_rows.extend(rows)
+            total = data.get("meta", {}).get("size", 0)
+            offset += len(rows)
+            if not rows or offset >= total:
+                break
+        return all_rows
 
     async def get_customer_order(self, order_id: str) -> Dict:
         """Get single customer order."""

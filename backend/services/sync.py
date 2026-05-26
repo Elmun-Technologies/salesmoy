@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -56,6 +56,13 @@ class SyncService:
     # full sync will run once and subsequent loops stay incremental.
     _initial_clients_synced: Dict[int, bool] = {}
 
+    # When each tenant's SD lookup caches (categories, price types, agents
+    # by name, order defaults) were last populated. Used to evict entries
+    # that are older than _SD_CACHE_TTL so operator changes in SD (new
+    # agents, renamed warehouses, etc.) propagate within a known window.
+    _sd_caches_loaded_at: Dict[int, datetime] = {}
+    _SD_CACHE_TTL = timedelta(hours=1)
+
     # Default currency to assume when MoySklad data doesn't expose it.
     # Set this to "USD" for tenants whose MoySklad catalog is priced in $.
     _default_price_currency: Dict[int, str] = {}
@@ -69,20 +76,11 @@ class SyncService:
     async def init_clients(self):
         """Initialize API clients with tenant credentials.
 
-        Proactively refreshes the MoySklad access token if it's expired (or
-        about to expire in the next 60 seconds) and a refresh_token is present.
-        The MoySkladClient also gets a refresh callback so any 401 mid-sync
-        triggers a one-shot refresh + replay (instead of breaking the cycle).
+        MoySklad uses a permanent access token (manually pasted in Settings).
+        SalesDoctor's token is refreshed on auth failure via re-login.
         """
         if self.tenant.moysklad_access_token:
-            # Proactive refresh — avoid burning the first batch of calls on a token
-            # we already know is dead.
-            await self._maybe_refresh_moysklad_token(grace_seconds=60)
-
-            self.ms = MoySkladClient(
-                token=self.tenant.moysklad_access_token,
-                refresh_callback=self._refresh_moysklad_token,
-            )
+            self.ms = MoySkladClient(token=self.tenant.moysklad_access_token)
             # Auto-discover and persist accountId for webhook routing
             if not self.tenant.moysklad_account_id:
                 try:
@@ -99,80 +97,89 @@ class SyncService:
                 user_id=self.tenant.salesdoctor_user_id,
                 token=self.tenant.salesdoctor_token,
                 filial_id=self.tenant.salesdoctor_filial_id or 0,
+                refresh_callback=self._refresh_salesdoctor_token,
             )
 
-    # ========== MoySklad token refresh ==========
+        # Drop stale SD lookup caches so freshly added agents/categories
+        # in SD start showing up after at most _SD_CACHE_TTL.
+        self._invalidate_stale_sd_caches()
 
-    async def _maybe_refresh_moysklad_token(self, grace_seconds: int = 60) -> bool:
-        """Refresh MoySklad token if it's expired or expires within grace_seconds.
+    # ========== SalesDoctor token refresh ==========
 
-        Returns True if a refresh was attempted AND succeeded.
-        Returns False if no refresh was needed, or it failed (caller decides what to do).
+    async def _refresh_salesdoctor_token(self) -> Optional[Dict[str, str]]:
+        """Re-login to SalesDoctor with stored credentials and persist new token.
+
+        Called by SalesDoctorClient when an auth-shaped error is detected.
+        Returns {"userId": ..., "token": ...} on success, None on failure.
         """
-        from datetime import datetime, timedelta
-        expires = self.tenant.moysklad_token_expires
-        if not expires:
-            # No known expiry — assume permanent token, don't preemptively refresh.
-            return False
-        if expires > datetime.utcnow() + timedelta(seconds=grace_seconds):
-            return False
-        if not self.tenant.moysklad_refresh_token:
-            logger.warning(
-                "Tenant %s MoySklad token expired at %s and no refresh_token saved",
-                self.tenant.id, expires,
-            )
-            return False
-        new_token = await self._refresh_moysklad_token()
-        return bool(new_token)
-
-    async def _refresh_moysklad_token(self) -> Optional[str]:
-        """Call MoySklad OAuth refresh endpoint and persist the new tokens.
-
-        Returns the new access token on success, None on failure.
-        Used both proactively (from init_clients) and reactively (as the
-        MoySkladClient.refresh_callback on 401).
-        """
-        from datetime import datetime, timedelta
-        from services.moysklad_oauth import MoySkladOAuth
-        from config import get_settings as _gs
-
-        s = _gs()
-        if not s.moysklad_client_id or not s.moysklad_client_secret:
+        login = (self.tenant.salesdoctor_login or "").strip()
+        password = self.tenant.salesdoctor_password or ""
+        base_url = (self.tenant.salesdoctor_base_url or "").strip()
+        if not login or not password or not base_url:
             logger.error(
-                "Tenant %s: cannot refresh MoySklad token — MOYSKLAD_CLIENT_ID/"
-                "CLIENT_SECRET not configured. Re-authorize via admin panel.",
-                self.tenant.id,
+                "Tenant %s: cannot refresh SalesDoctor token — login/password/base_url "
+                "missing. Operator must re-enter credentials.", self.tenant.id,
             )
-            return None
-        if not self.tenant.moysklad_refresh_token:
-            logger.error(
-                "Tenant %s: cannot refresh MoySklad token — no refresh_token saved.",
-                self.tenant.id,
-            )
+            try:
+                await self.log(
+                    LogType.ERROR, "Auth",
+                    "SalesDoctor token expired and stored credentials are incomplete — "
+                    "re-connect SalesDoctor in Settings.",
+                )
+            except Exception:
+                pass
             return None
         try:
-            oauth = MoySkladOAuth(
-                client_id=s.moysklad_client_id,
-                client_secret=s.moysklad_client_secret,
-                redirect_uri=s.moysklad_redirect_uri,
-            )
-            tokens = await oauth.refresh_access_token(self.tenant.moysklad_refresh_token)
-            new_access = tokens.get("access_token")
-            new_refresh = tokens.get("refresh_token") or self.tenant.moysklad_refresh_token
-            expires_in = int(tokens.get("expires_in", 86400))
-            if not new_access:
-                logger.error("MoySklad refresh returned no access_token: %s", tokens)
-                return None
-            self.tenant.moysklad_access_token = new_access
-            self.tenant.moysklad_refresh_token = new_refresh
-            self.tenant.moysklad_token_expires = datetime.utcnow() + timedelta(seconds=expires_in)
+            creds = await SalesDoctorClient.login(base_url, login, password)
+            self.tenant.salesdoctor_user_id = creds["userId"]
+            self.tenant.salesdoctor_token = creds["token"]
+            self.tenant.salesdoctor_token_obtained_at = datetime.utcnow()
             await self.db.commit()
-            logger.info("Tenant %s: MoySklad token refreshed (expires_in=%ds)",
-                        self.tenant.id, expires_in)
-            return new_access
+            logger.info("Tenant %s: SalesDoctor token refreshed via re-login", self.tenant.id)
+            return creds
         except Exception as e:
-            logger.error("Tenant %s: MoySklad token refresh failed: %s", self.tenant.id, e)
+            logger.error("Tenant %s: SalesDoctor re-login failed: %s", self.tenant.id, e)
+            try:
+                await self.log(
+                    LogType.ERROR, "Auth",
+                    f"SalesDoctor re-login failed: {e}. Operator must update credentials.",
+                )
+            except Exception:
+                pass
             return None
+
+    # ========== Cache hygiene ==========
+
+    def _invalidate_stale_sd_caches(self) -> None:
+        """Drop SD lookup caches for this tenant if older than _SD_CACHE_TTL.
+
+        Without this, the per-tenant class-level caches survive the entire
+        worker lifetime and never see new SD agents/categories the operator
+        adds after first sync.
+        """
+        loaded = SyncService._sd_caches_loaded_at.get(self.tenant.id)
+        if loaded is None:
+            SyncService._sd_caches_loaded_at[self.tenant.id] = datetime.utcnow()
+            return
+        if datetime.utcnow() - loaded < SyncService._SD_CACHE_TTL:
+            return
+        for cache in (
+            SyncService._sd_client_categories,
+            SyncService._sd_default_agent,
+            SyncService._sd_agents_by_name,
+            SyncService._sd_order_defaults,
+            SyncService._sd_retail_price_type,
+        ):
+            cache.pop(self.tenant.id, None)
+        SyncService._sd_caches_loaded_at[self.tenant.id] = datetime.utcnow()
+
+    async def _mark_sync_healthy(self) -> None:
+        """Update tenant.last_successful_sync_at — health signal for monitoring."""
+        try:
+            self.tenant.last_successful_sync_at = datetime.utcnow()
+            await self.db.commit()
+        except Exception as e:
+            logger.warning("Could not update last_successful_sync_at: %s", e)
 
     # ========== Logging ==========
 

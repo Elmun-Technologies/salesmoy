@@ -9,21 +9,14 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
-    # MoySklad API + Marketplace OAuth (https://dev.moysklad.ru/doc/api/remap/1.2/#/general/oauth)
+    # MoySklad API (permanent token pasted in Settings — no OAuth).
     moysklad_token: str = ""
     moysklad_base_url: str = "https://api.moysklad.ru/api/remap/1.2"
     moysklad_account: str = ""
-    moysklad_client_id: str = ""
-    moysklad_client_secret: str = ""
-    moysklad_redirect_uri: str = "http://localhost:8000/api/auth/moysklad/callback"
 
     # JWT (use APP_SECRET_KEY — min 32 chars in production)
     jwt_algorithm: str = "HS256"
     jwt_access_token_expire_minutes: int = 60 * 24 * 7  # 7 days
-    moysklad_oauth_state_expire_minutes: int = 15
-
-    # After MoySklad OAuth redirect (browser)
-    frontend_base_url: str = "http://localhost:5173"
 
     # Sales Doctor (credentials are stored per-tenant in DB, not in env)
     salesdoctor_base_url: str = "https://your-sd-server/api/v2/"

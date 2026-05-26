@@ -1,13 +1,9 @@
-"""Authentication, JWT, and MoySklad OAuth for marketplace deployment."""
+"""Authentication and JWT for an individual-tenant deployment."""
 
 import logging
-from datetime import datetime, timedelta
 from typing import Optional
-from urllib.parse import quote
 
-import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,12 +13,7 @@ from passlib.context import CryptContext
 from config import get_settings
 from database import get_db
 from models import Tenant, User
-from security.jwt_tokens import (
-    create_access_token,
-    create_moysklad_oauth_state_token,
-    decode_moysklad_oauth_state_token,
-)
-from services.moysklad_oauth import MoySkladOAuth, fetch_moysklad_account_id
+from security.jwt_tokens import create_access_token
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +40,6 @@ class LoginRequest(BaseModel):
 
 class ConnectMoySkladRequest(BaseModel):
     access_token: str
-    refresh_token: Optional[str] = None
-    expires_in: int = 86400
     account_id: str = ""
 
 
@@ -233,108 +222,13 @@ async def login(data: LoginRequest, db: AsyncSession = Depends(get_db)):
     }
 
 
-@router.get("/moysklad/authorize-url")
-async def moysklad_authorize_url(request: Request):
-    """Return MoySklad OAuth URL (Marketplace). Frontend opens `url` in same tab."""
-    settings = get_settings()
-    if not settings.moysklad_client_id or not settings.moysklad_client_secret:
-        raise HTTPException(
-            status_code=503,
-            detail="MoySklad OAuth is not configured (MOYSKLAD_CLIENT_ID / SECRET)",
-        )
-    tenant_id = getattr(request.state, "tenant_id", None)
-    if not tenant_id:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    state = create_moysklad_oauth_state_token(tenant_id)
-    oauth = MoySkladOAuth(
-        settings.moysklad_client_id,
-        settings.moysklad_client_secret,
-        settings.moysklad_redirect_uri,
-    )
-    return {"url": oauth.get_auth_url(state)}
-
-
-@router.get("/moysklad/callback")
-async def moysklad_oauth_callback(
-    code: Optional[str] = None,
-    state: Optional[str] = None,
-    error: Optional[str] = None,
-    error_description: Optional[str] = None,
-    db: AsyncSession = Depends(get_db),
-):
-    """MoySklad redirects here after user consent (browser)."""
-    settings = get_settings()
-    base = settings.frontend_base_url.rstrip("/")
-
-    def redirect(err: Optional[str] = None, ok: bool = False):
-        if ok:
-            return RedirectResponse(url=f"{base}/?moysklad_connected=1")
-        q = err or error or "oauth_failed"
-        if error_description:
-            q = f"{q}:{error_description[:120]}"
-        return RedirectResponse(url=f"{base}/?moysklad_error={quote(q, safe='')}")
-
-    if error:
-        return redirect()
-
-    if not code or not state:
-        return redirect("missing_code_or_state")
-
-    if not settings.moysklad_client_id:
-        return redirect("oauth_not_configured")
-
-    try:
-        tenant_id = decode_moysklad_oauth_state_token(state)
-    except jwt.PyJWTError:
-        return redirect("invalid_state")
-
-    oauth = MoySkladOAuth(
-        settings.moysklad_client_id,
-        settings.moysklad_client_secret,
-        settings.moysklad_redirect_uri,
-    )
-
-    try:
-        tokens = await oauth.exchange_code(code)
-    except Exception as e:
-        return redirect(f"token_exchange:{str(e)[:80]}")
-
-    access = tokens.get("access_token")
-    if not access:
-        return redirect("no_access_token")
-
-    refresh = tokens.get("refresh_token")
-    expires_in = int(tokens.get("expires_in", 86400))
-
-    result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
-    tenant = result.scalar_one_or_none()
-    if not tenant:
-        return redirect("tenant_not_found")
-
-    tenant.moysklad_access_token = access
-    tenant.moysklad_refresh_token = refresh
-    tenant.moysklad_token_expires = datetime.utcnow() + timedelta(seconds=expires_in)
-
-    account_id = await fetch_moysklad_account_id(access, settings.moysklad_base_url)
-    if account_id:
-        tenant.moysklad_account_id = account_id
-
-    await db.commit()
-
-    # Auto-register webhooks so real-time sync works immediately
-    await _auto_register_webhooks(tenant, db)
-
-    return redirect(ok=True)
-
-
 @router.post("/connect/moysklad")
 async def connect_moysklad(
     data: ConnectMoySkladRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Paste MoySklad token manually (JSON access_token)."""
+    """Save a MoySklad permanent access token (pasted from MoySklad UI)."""
     from services.moysklad import MoySkladClient, MoySkladAuthError, MoySkladError
 
     tenant_id = getattr(request.state, "tenant_id", None)
@@ -347,8 +241,8 @@ async def connect_moysklad(
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
-    # Validate token against MoySklad before saving — reject expired/invalid tokens
-    # up front instead of silently storing them and breaking sync later.
+    # Validate the token before storing it. A bad token here would otherwise
+    # break every subsequent sync with no clear signal to the operator.
     probe = MoySkladClient(token=data.access_token)
     try:
         account_id = await probe.get_account_id()
@@ -356,7 +250,7 @@ async def connect_moysklad(
         await probe.close()
         raise HTTPException(
             status_code=400,
-            detail="MoySklad token noto'g'ri yoki muddati o'tgan. Yangi token oling.",
+            detail="MoySklad token noto'g'ri yoki bekor qilingan. Yangi token oling.",
         )
     except MoySkladError as e:
         await probe.close()
@@ -371,8 +265,6 @@ async def connect_moysklad(
         )
 
     tenant.moysklad_access_token = data.access_token
-    tenant.moysklad_refresh_token = data.refresh_token
-    tenant.moysklad_token_expires = datetime.utcnow() + timedelta(seconds=data.expires_in)
     tenant.moysklad_account_id = data.account_id or account_id
 
     await db.commit()
@@ -407,12 +299,14 @@ async def connect_salesdoctor(
     except SalesDoctorError as e:
         raise HTTPException(status_code=400, detail=f"Sales Doctor login failed: {e}")
 
+    from datetime import datetime as _dt
     tenant.salesdoctor_base_url = data.base_url
     tenant.salesdoctor_login = data.login
     tenant.salesdoctor_password = data.password
     tenant.salesdoctor_user_id = creds["userId"]
     tenant.salesdoctor_token = creds["token"]
     tenant.salesdoctor_filial_id = data.filial_id
+    tenant.salesdoctor_token_obtained_at = _dt.utcnow()
 
     await db.commit()
 

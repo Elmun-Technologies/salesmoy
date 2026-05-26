@@ -1,4 +1,4 @@
-"""Main FastAPI application for Sales Doctor ↔ MoySklad Integration (Marketplace Edition)."""
+"""Main FastAPI application for Sales Doctor ↔ MoySklad Integration."""
 
 import asyncio
 import logging
@@ -33,11 +33,19 @@ logger = logging.getLogger(__name__)
 
 # ========== Background Tasks ==========
 
+# Per-tenant timeout for a single pass of a sync method group. Without
+# this, one slow tenant (MS API hang, SD network stall) can stall the
+# whole loop and starve every other tenant.
+_PER_TENANT_SYNC_TIMEOUT_S = 300
+
+
 async def _run_sync_for_all_tenants(method_names: list[str], label: str) -> None:
     """Iterate all active tenants and run the given SyncService methods.
 
     `method_names` are called in order on each tenant's SyncService instance.
-    Per-tenant failures are isolated — one bad tenant can't break the others.
+    Per-tenant failures and timeouts are isolated — one bad tenant can't
+    break or stall the others. On success, the tenant's
+    `last_successful_sync_at` is advanced as a health signal.
     """
     from services.sync import SyncService
     from database import AsyncSessionLocal
@@ -50,11 +58,23 @@ async def _run_sync_for_all_tenants(method_names: list[str], label: str) -> None
         for tenant in tenants:
             try:
                 service = SyncService(db, tenant)
-                await service.init_clients()
-                for m in method_names:
-                    await getattr(service, m)()
+                await asyncio.wait_for(
+                    _run_one_tenant(service, method_names),
+                    timeout=_PER_TENANT_SYNC_TIMEOUT_S,
+                )
+                await service._mark_sync_healthy()
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"{label} timed out (>{_PER_TENANT_SYNC_TIMEOUT_S}s) for tenant {tenant.id}",
+                )
             except Exception as e:
                 logger.error(f"{label} error for tenant {tenant.id}: {e}")
+
+
+async def _run_one_tenant(service, method_names: list[str]) -> None:
+    await service.init_clients()
+    for m in method_names:
+        await getattr(service, m)()
 
 
 async def stock_sync_loop():
@@ -111,12 +131,54 @@ async def order_sync_loop():
             logger.error(f"Order sync loop error: {e}")
 
 
+# Retention windows. SyncLog rows are noisy and only useful for recent
+# debugging; processed WebhookEvent rows have no value after a short
+# while. Without cleanup, both tables grow without bound and gradually
+# drag query latency down across the integration.
+_SYNC_LOG_RETENTION_DAYS = 90
+_WEBHOOK_EVENT_RETENTION_DAYS = 30
+_RETENTION_LOOP_INTERVAL_S = 24 * 3600
+
+
+async def retention_cleanup_loop():
+    """Once a day, delete old rows from sync_logs and webhook_events."""
+    from datetime import timedelta
+    from sqlalchemy import delete
+    from database import AsyncSessionLocal
+    from models import SyncLog, WebhookEvent
+
+    while True:
+        try:
+            await asyncio.sleep(_RETENTION_LOOP_INTERVAL_S)
+            now = datetime.utcnow()
+            log_cutoff = now - timedelta(days=_SYNC_LOG_RETENTION_DAYS)
+            wh_cutoff = now - timedelta(days=_WEBHOOK_EVENT_RETENTION_DAYS)
+            async with AsyncSessionLocal() as db:
+                r1 = await db.execute(
+                    delete(SyncLog).where(SyncLog.created_at < log_cutoff)
+                )
+                r2 = await db.execute(
+                    delete(WebhookEvent).where(
+                        WebhookEvent.processed == True,
+                        WebhookEvent.created_at < wh_cutoff,
+                    )
+                )
+                await db.commit()
+                logger.info(
+                    "Retention cleanup: dropped %s sync_logs (>%sd), %s webhook_events (>%sd)",
+                    r1.rowcount, _SYNC_LOG_RETENTION_DAYS,
+                    r2.rowcount, _WEBHOOK_EVENT_RETENTION_DAYS,
+                )
+        except Exception as e:
+            logger.error(f"Retention cleanup loop error: {e}")
+
+
 # ========== Lifespan ==========
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
-    logger.info("🚀 Starting Sales Doctor ↔ MoySklad Integration Server (Marketplace Edition)")
+    logger.info("🚀 Starting Sales Doctor ↔ MoySklad Integration Server")
 
     # Initialize database
     await init_db()
@@ -159,8 +221,12 @@ async def lifespan(app: FastAPI):
             asyncio.create_task(debt_sync_loop()),
             asyncio.create_task(client_sync_loop()),
             asyncio.create_task(order_sync_loop()),
+            asyncio.create_task(retention_cleanup_loop()),
         ]
-        logger.info(f"📡 Background sync started (leader pid={os.getpid()}) — stock, debts, clients, orders")
+        logger.info(
+            f"📡 Background sync started (leader pid={os.getpid()}) — "
+            f"stock, debts, clients, orders, retention cleanup"
+        )
 
     yield
 
@@ -182,7 +248,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Sales Doctor ↔ MoySklad Integration API",
     description="Multi-tenant REST API for synchronizing data between Sales Doctor and MoySklad",
-    version="2.0.0-marketplace",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -220,7 +286,7 @@ async def root():
     """Root endpoint with API info."""
     return {
         "name": "Sales Doctor ↔ MoySklad Integration API",
-        "version": "2.0.0-marketplace",
+        "version": "2.0.0",
         "mode": "multi-tenant",
         "status": "running",
         "timestamp": datetime.utcnow().isoformat(),

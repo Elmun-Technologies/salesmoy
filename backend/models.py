@@ -62,10 +62,8 @@ class Tenant(Base):
     email = Column(String(255), unique=True, index=True, nullable=False)
     phone = Column(String(50), nullable=True)
 
-    # MoySklad OAuth
+    # MoySklad: permanent access token (pasted from MoySklad UI). No OAuth.
     moysklad_access_token = Column(Text, nullable=True)
-    moysklad_refresh_token = Column(Text, nullable=True)
-    moysklad_token_expires = Column(DateTime, nullable=True)
     moysklad_account_id = Column(String(100), nullable=True)
 
     # Sales Doctor API (JSON-RPC login/token auth)
@@ -75,9 +73,17 @@ class Tenant(Base):
     salesdoctor_user_id = Column(String(100), nullable=True)
     salesdoctor_token = Column(Text, nullable=True)
     salesdoctor_filial_id = Column(Integer, default=0)
+    # When the SD token was last successfully obtained — drives proactive
+    # re-login so a long-idle tenant isn't stuck on an aged token.
+    salesdoctor_token_obtained_at = Column(DateTime, nullable=True)
 
     is_active = Column(Boolean, default=True)
     sync_interval_seconds = Column(Integer, default=60)
+
+    # Health signal: timestamp of the most recent sync that completed
+    # without raising. If this stops advancing for hours, the tenant's
+    # credentials are likely dead.
+    last_successful_sync_at = Column(DateTime, nullable=True)
 
     # Webhook
     webhook_url = Column(String(500), nullable=True)
@@ -148,7 +154,13 @@ class Order(Base):
     client = relationship("Client", back_populates="orders")
     logs = relationship("SyncLog", back_populates="order")
 
-    __table_args__ = (Index("ix_orders_tenant_order_id", "tenant_id", "order_id", unique=True),)
+    __table_args__ = (
+        Index("ix_orders_tenant_order_id", "tenant_id", "order_id", unique=True),
+        # Prevents duplicate inserts when the same MoySklad order webhook
+        # is delivered twice (NULLs are treated as distinct, so orders
+        # synced before MS was wired up still coexist).
+        Index("ix_orders_tenant_ms_id", "tenant_id", "moysklad_id", unique=True),
+    )
 
 
 # ========== Client ==========
