@@ -10,7 +10,7 @@ Status codes (setOrder):
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -41,11 +41,21 @@ class SalesDoctorClient:
         "User-Agent": "Mozilla/5.0 (compatible; SalesMoy-Integration/1.0)",
     }
 
-    def __init__(self, base_url: str, user_id: str, token: str, filial_id: int = 0):
+    def __init__(
+        self,
+        base_url: str,
+        user_id: str,
+        token: str,
+        filial_id: int = 0,
+        refresh_callback: Optional[Callable[[], Awaitable[Optional[Dict[str, str]]]]] = None,
+    ):
         self.base_url = base_url.rstrip("/") + "/"
         self.user_id = user_id
         self.token = token
         self.filial_id = filial_id
+        # If provided, called once when an SD call fails with an auth error.
+        # Must return {"userId": ..., "token": ...} or None on failure.
+        self._refresh_callback = refresh_callback
         # Sales Doctor's TLS cert (api.salesdoctor.uz) is misconfigured — hostname
         # mismatch trips Python's SSL verification. Skip verification so the
         # integration can talk to the upstream; revisit if/when SD fixes their cert.
@@ -62,9 +72,27 @@ class SalesDoctorClient:
     def _filial(self) -> Dict:
         return {"filial_id": self.filial_id}
 
+    _AUTH_ERROR_MARKERS = ("token", "auth", "unauthorized", "unauthenticated", "expired", "session")
+
+    def _looks_like_auth_error(self, message: str, http_status: Optional[int] = None) -> bool:
+        if http_status in (401, 403):
+            return True
+        if not message:
+            return False
+        m = message.lower()
+        return any(marker in m for marker in self._AUTH_ERROR_MARKERS)
+
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
     async def _rpc(self, method: str, data: Any, include_filial: bool = True) -> Dict:
-        """Send a JSON-RPC style request to Sales Doctor."""
+        """Send a JSON-RPC style request to Sales Doctor.
+
+        On an auth-shaped failure, calls refresh_callback once and retries.
+        """
+        return await self._rpc_once(method, data, include_filial, allow_refresh=True)
+
+    async def _rpc_once(
+        self, method: str, data: Any, include_filial: bool, allow_refresh: bool,
+    ) -> Dict:
         payload: Dict = {
             "auth": self._auth(),
             "method": method,
@@ -100,6 +128,9 @@ class SalesDoctorClient:
                     raw_snippet = str(result)[:500]
                     detail_msg = f"SD returned error for [{method}]: {raw_snippet}"
                 if completed == 0:
+                    if allow_refresh and self._refresh_callback and self._looks_like_auth_error(detail_msg):
+                        if await self._try_refresh():
+                            return await self._rpc_once(method, data, include_filial, allow_refresh=False)
                     raise SalesDoctorError(detail_msg)
                 logger.warning(
                     "SD partial error in %s (completed=%s, failed=%s): %s",
@@ -107,11 +138,39 @@ class SalesDoctorClient:
                 )
             return result.get("result", result) if isinstance(result, dict) else result
         except httpx.HTTPStatusError as e:
-            logger.error("SalesDoctor HTTP %s: %s", e.response.status_code, e.response.text)
-            raise SalesDoctorError(f"HTTP {e.response.status_code}: {e.response.text}")
+            status = e.response.status_code
+            body = e.response.text
+            logger.error("SalesDoctor HTTP %s: %s", status, body)
+            if allow_refresh and self._refresh_callback and self._looks_like_auth_error(body, status):
+                if await self._try_refresh():
+                    return await self._rpc_once(method, data, include_filial, allow_refresh=False)
+            raise SalesDoctorError(f"HTTP {status}: {body}")
         except httpx.RequestError as e:
             logger.error("SalesDoctor request error: %s", e)
             raise SalesDoctorError(f"Request failed: {e}")
+
+    async def _try_refresh(self) -> bool:
+        """Run the refresh callback once and rotate credentials in place.
+
+        Returns True if new credentials were applied.
+        """
+        if not self._refresh_callback:
+            return False
+        try:
+            creds = await self._refresh_callback()
+        except Exception as e:
+            logger.error("SalesDoctor refresh_callback raised: %s", e)
+            return False
+        if not isinstance(creds, dict):
+            return False
+        new_user = str(creds.get("userId") or "").strip()
+        new_token = str(creds.get("token") or "").strip()
+        if not new_user or not new_token:
+            return False
+        self.user_id = new_user
+        self.token = new_token
+        logger.info("SalesDoctor credentials rotated via refresh_callback")
+        return True
 
     # ========== Auth (class method — used before client instantiation) ==========
 

@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -56,6 +56,13 @@ class SyncService:
     # full sync will run once and subsequent loops stay incremental.
     _initial_clients_synced: Dict[int, bool] = {}
 
+    # When each tenant's SD lookup caches (categories, price types, agents
+    # by name, order defaults) were last populated. Used to evict entries
+    # that are older than _SD_CACHE_TTL so operator changes in SD (new
+    # agents, renamed warehouses, etc.) propagate within a known window.
+    _sd_caches_loaded_at: Dict[int, datetime] = {}
+    _SD_CACHE_TTL = timedelta(hours=1)
+
     # Default currency to assume when MoySklad data doesn't expose it.
     # Set this to "USD" for tenants whose MoySklad catalog is priced in $.
     _default_price_currency: Dict[int, str] = {}
@@ -99,7 +106,12 @@ class SyncService:
                 user_id=self.tenant.salesdoctor_user_id,
                 token=self.tenant.salesdoctor_token,
                 filial_id=self.tenant.salesdoctor_filial_id or 0,
+                refresh_callback=self._refresh_salesdoctor_token,
             )
+
+        # Drop stale SD lookup caches so freshly added agents/categories
+        # in SD start showing up after at most _SD_CACHE_TTL.
+        self._invalidate_stale_sd_caches()
 
     # ========== MoySklad token refresh ==========
 
@@ -171,8 +183,97 @@ class SyncService:
                         self.tenant.id, expires_in)
             return new_access
         except Exception as e:
+            # Refresh tokens expire after ~30 days of inactivity. When that
+            # happens this raises and the tenant is stuck until they re-OAuth.
+            # Surface this loudly so it shows up in the logs panel rather
+            # than only the server log file.
             logger.error("Tenant %s: MoySklad token refresh failed: %s", self.tenant.id, e)
+            try:
+                await self.log(
+                    LogType.ERROR, "Auth",
+                    "MoySklad refresh_token rejected — operator must re-authorize "
+                    f"via Settings > MoySklad. Underlying error: {e}",
+                )
+            except Exception:
+                pass
             return None
+
+    # ========== SalesDoctor token refresh ==========
+
+    async def _refresh_salesdoctor_token(self) -> Optional[Dict[str, str]]:
+        """Re-login to SalesDoctor with stored credentials and persist new token.
+
+        Called by SalesDoctorClient when an auth-shaped error is detected.
+        Returns {"userId": ..., "token": ...} on success, None on failure.
+        """
+        login = (self.tenant.salesdoctor_login or "").strip()
+        password = self.tenant.salesdoctor_password or ""
+        base_url = (self.tenant.salesdoctor_base_url or "").strip()
+        if not login or not password or not base_url:
+            logger.error(
+                "Tenant %s: cannot refresh SalesDoctor token — login/password/base_url "
+                "missing. Operator must re-enter credentials.", self.tenant.id,
+            )
+            try:
+                await self.log(
+                    LogType.ERROR, "Auth",
+                    "SalesDoctor token expired and stored credentials are incomplete — "
+                    "re-connect SalesDoctor in Settings.",
+                )
+            except Exception:
+                pass
+            return None
+        try:
+            creds = await SalesDoctorClient.login(base_url, login, password)
+            self.tenant.salesdoctor_user_id = creds["userId"]
+            self.tenant.salesdoctor_token = creds["token"]
+            self.tenant.salesdoctor_token_obtained_at = datetime.utcnow()
+            await self.db.commit()
+            logger.info("Tenant %s: SalesDoctor token refreshed via re-login", self.tenant.id)
+            return creds
+        except Exception as e:
+            logger.error("Tenant %s: SalesDoctor re-login failed: %s", self.tenant.id, e)
+            try:
+                await self.log(
+                    LogType.ERROR, "Auth",
+                    f"SalesDoctor re-login failed: {e}. Operator must update credentials.",
+                )
+            except Exception:
+                pass
+            return None
+
+    # ========== Cache hygiene ==========
+
+    def _invalidate_stale_sd_caches(self) -> None:
+        """Drop SD lookup caches for this tenant if older than _SD_CACHE_TTL.
+
+        Without this, the per-tenant class-level caches survive the entire
+        worker lifetime and never see new SD agents/categories the operator
+        adds after first sync.
+        """
+        loaded = SyncService._sd_caches_loaded_at.get(self.tenant.id)
+        if loaded is None:
+            SyncService._sd_caches_loaded_at[self.tenant.id] = datetime.utcnow()
+            return
+        if datetime.utcnow() - loaded < SyncService._SD_CACHE_TTL:
+            return
+        for cache in (
+            SyncService._sd_client_categories,
+            SyncService._sd_default_agent,
+            SyncService._sd_agents_by_name,
+            SyncService._sd_order_defaults,
+            SyncService._sd_retail_price_type,
+        ):
+            cache.pop(self.tenant.id, None)
+        SyncService._sd_caches_loaded_at[self.tenant.id] = datetime.utcnow()
+
+    async def _mark_sync_healthy(self) -> None:
+        """Update tenant.last_successful_sync_at — health signal for monitoring."""
+        try:
+            self.tenant.last_successful_sync_at = datetime.utcnow()
+            await self.db.commit()
+        except Exception as e:
+            logger.warning("Could not update last_successful_sync_at: %s", e)
 
     # ========== Logging ==========
 

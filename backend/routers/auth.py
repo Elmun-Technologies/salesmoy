@@ -407,12 +407,14 @@ async def connect_salesdoctor(
     except SalesDoctorError as e:
         raise HTTPException(status_code=400, detail=f"Sales Doctor login failed: {e}")
 
+    from datetime import datetime as _dt
     tenant.salesdoctor_base_url = data.base_url
     tenant.salesdoctor_login = data.login
     tenant.salesdoctor_password = data.password
     tenant.salesdoctor_user_id = creds["userId"]
     tenant.salesdoctor_token = creds["token"]
     tenant.salesdoctor_filial_id = data.filial_id
+    tenant.salesdoctor_token_obtained_at = _dt.utcnow()
 
     await db.commit()
 
