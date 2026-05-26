@@ -1,4 +1,4 @@
-"""Main FastAPI application for Sales Doctor ↔ MoySklad Integration (Marketplace Edition)."""
+"""Main FastAPI application for Sales Doctor ↔ MoySklad Integration."""
 
 import asyncio
 import logging
@@ -178,7 +178,7 @@ async def retention_cleanup_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
-    logger.info("🚀 Starting Sales Doctor ↔ MoySklad Integration Server (Marketplace Edition)")
+    logger.info("🚀 Starting Sales Doctor ↔ MoySklad Integration Server")
 
     # Initialize database
     await init_db()
@@ -248,7 +248,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Sales Doctor ↔ MoySklad Integration API",
     description="Multi-tenant REST API for synchronizing data between Sales Doctor and MoySklad",
-    version="2.0.0-marketplace",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -286,7 +286,7 @@ async def root():
     """Root endpoint with API info."""
     return {
         "name": "Sales Doctor ↔ MoySklad Integration API",
-        "version": "2.0.0-marketplace",
+        "version": "2.0.0",
         "mode": "multi-tenant",
         "status": "running",
         "timestamp": datetime.utcnow().isoformat(),

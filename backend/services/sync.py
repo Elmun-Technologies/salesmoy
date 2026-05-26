@@ -76,20 +76,11 @@ class SyncService:
     async def init_clients(self):
         """Initialize API clients with tenant credentials.
 
-        Proactively refreshes the MoySklad access token if it's expired (or
-        about to expire in the next 60 seconds) and a refresh_token is present.
-        The MoySkladClient also gets a refresh callback so any 401 mid-sync
-        triggers a one-shot refresh + replay (instead of breaking the cycle).
+        MoySklad uses a permanent access token (manually pasted in Settings).
+        SalesDoctor's token is refreshed on auth failure via re-login.
         """
         if self.tenant.moysklad_access_token:
-            # Proactive refresh — avoid burning the first batch of calls on a token
-            # we already know is dead.
-            await self._maybe_refresh_moysklad_token(grace_seconds=60)
-
-            self.ms = MoySkladClient(
-                token=self.tenant.moysklad_access_token,
-                refresh_callback=self._refresh_moysklad_token,
-            )
+            self.ms = MoySkladClient(token=self.tenant.moysklad_access_token)
             # Auto-discover and persist accountId for webhook routing
             if not self.tenant.moysklad_account_id:
                 try:
@@ -112,91 +103,6 @@ class SyncService:
         # Drop stale SD lookup caches so freshly added agents/categories
         # in SD start showing up after at most _SD_CACHE_TTL.
         self._invalidate_stale_sd_caches()
-
-    # ========== MoySklad token refresh ==========
-
-    async def _maybe_refresh_moysklad_token(self, grace_seconds: int = 60) -> bool:
-        """Refresh MoySklad token if it's expired or expires within grace_seconds.
-
-        Returns True if a refresh was attempted AND succeeded.
-        Returns False if no refresh was needed, or it failed (caller decides what to do).
-        """
-        from datetime import datetime, timedelta
-        expires = self.tenant.moysklad_token_expires
-        if not expires:
-            # No known expiry — assume permanent token, don't preemptively refresh.
-            return False
-        if expires > datetime.utcnow() + timedelta(seconds=grace_seconds):
-            return False
-        if not self.tenant.moysklad_refresh_token:
-            logger.warning(
-                "Tenant %s MoySklad token expired at %s and no refresh_token saved",
-                self.tenant.id, expires,
-            )
-            return False
-        new_token = await self._refresh_moysklad_token()
-        return bool(new_token)
-
-    async def _refresh_moysklad_token(self) -> Optional[str]:
-        """Call MoySklad OAuth refresh endpoint and persist the new tokens.
-
-        Returns the new access token on success, None on failure.
-        Used both proactively (from init_clients) and reactively (as the
-        MoySkladClient.refresh_callback on 401).
-        """
-        from datetime import datetime, timedelta
-        from services.moysklad_oauth import MoySkladOAuth
-        from config import get_settings as _gs
-
-        s = _gs()
-        if not s.moysklad_client_id or not s.moysklad_client_secret:
-            logger.error(
-                "Tenant %s: cannot refresh MoySklad token — MOYSKLAD_CLIENT_ID/"
-                "CLIENT_SECRET not configured. Re-authorize via admin panel.",
-                self.tenant.id,
-            )
-            return None
-        if not self.tenant.moysklad_refresh_token:
-            logger.error(
-                "Tenant %s: cannot refresh MoySklad token — no refresh_token saved.",
-                self.tenant.id,
-            )
-            return None
-        try:
-            oauth = MoySkladOAuth(
-                client_id=s.moysklad_client_id,
-                client_secret=s.moysklad_client_secret,
-                redirect_uri=s.moysklad_redirect_uri,
-            )
-            tokens = await oauth.refresh_access_token(self.tenant.moysklad_refresh_token)
-            new_access = tokens.get("access_token")
-            new_refresh = tokens.get("refresh_token") or self.tenant.moysklad_refresh_token
-            expires_in = int(tokens.get("expires_in", 86400))
-            if not new_access:
-                logger.error("MoySklad refresh returned no access_token: %s", tokens)
-                return None
-            self.tenant.moysklad_access_token = new_access
-            self.tenant.moysklad_refresh_token = new_refresh
-            self.tenant.moysklad_token_expires = datetime.utcnow() + timedelta(seconds=expires_in)
-            await self.db.commit()
-            logger.info("Tenant %s: MoySklad token refreshed (expires_in=%ds)",
-                        self.tenant.id, expires_in)
-            return new_access
-        except Exception as e:
-            # Refresh tokens expire after ~30 days of inactivity. When that
-            # happens this raises and the tenant is stuck until they re-OAuth.
-            # Surface this loudly so it shows up in the logs panel rather
-            # than only the server log file.
-            logger.error("Tenant %s: MoySklad token refresh failed: %s", self.tenant.id, e)
-            try:
-                await self.log(
-                    LogType.ERROR, "Auth",
-                    "MoySklad refresh_token rejected — operator must re-authorize "
-                    f"via Settings > MoySklad. Underlying error: {e}",
-                )
-            except Exception:
-                pass
-            return None
 
     # ========== SalesDoctor token refresh ==========
 

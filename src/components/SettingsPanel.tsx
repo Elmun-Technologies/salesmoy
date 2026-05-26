@@ -4,7 +4,6 @@ import {
   Shield,
   Key,
   CheckCircle2,
-  Globe,
   Database,
   RefreshCw,
   Building2,
@@ -15,7 +14,6 @@ import {
   getMe,
   connectMoySklad,
   connectSalesDoctor,
-  startMoySkladOAuth,
   getMoySkladWebhookStatus,
   registerMoySkladWebhooks,
   unregisterMoySkladWebhooks,
@@ -91,23 +89,10 @@ export default function SettingsPanel() {
     load();
   }, []);
 
-  async function handleMoySkladMarketplaceOAuth() {
-    try {
-      await startMoySkladOAuth();
-    } catch (e) {
-      console.error(e);
-      window.alert(
-        e instanceof Error ? e.message : 'MoySklad OAuth xizmati sozlanmagan yoki xatolik yuz berdi'
-      );
-    }
-  }
-
   async function handleConnectMoySklad() {
     try {
       await connectMoySklad({
         access_token: msToken,
-        refresh_token: '',
-        expires_in: 86400,
         account_id: '',
       });
       const me = await getMe();
@@ -208,16 +193,8 @@ export default function SettingsPanel() {
         </div>
 
         <div className="space-y-4">
-          <button
-            onClick={handleMoySkladMarketplaceOAuth}
-            className="flex items-center gap-2 px-4 py-2 bg-blue-100 hover:bg-blue-200 text-blue-700 rounded-lg text-sm font-medium transition-colors"
-          >
-            <Globe className="w-4 h-4" />
-            MoySklad Marketplace OAuth orqali ulash
-          </button>
           <p className="text-xs text-slate-500">
-            Yoki qo'lda access token kiriting (JSON dagi <code className="bg-slate-100 px-1 rounded">access_token</code>{' '}
-            qiymati):
+            MoySklad &gt; Settings &gt; Access tokens dan permanent token oling va shu yerga joylashtiring.
           </p>
 
           <div>

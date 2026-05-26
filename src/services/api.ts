@@ -90,36 +90,6 @@ async function withFallback<T>(realCall: () => Promise<T>, mockCall: () => Promi
   }
 }
 
-/** MoySklad Marketplace OAuth — redirects browser to MoySklad, then back to FRONTEND_BASE callback */
-export async function startMoySkladOAuth(): Promise<void> {
-  if (USE_MOCK) {
-    window.alert('Demo rejimida OAuth mavjud emas.');
-    return;
-  }
-  const token = getAccessToken();
-  if (!token) {
-    window.alert('Avval tizimga kiring.');
-    return;
-  }
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${token}`,
-  };
-  const slug = getTenantSlug();
-  if (slug) headers['X-Tenant-Slug'] = slug;
-
-  const res = await fetch(`${API_BASE}/api/auth/moysklad/authorize-url`, { headers });
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(t || `HTTP ${res.status}`);
-  }
-  const data = await res.json();
-  if (data.url) {
-    window.location.href = data.url;
-  } else {
-    throw new Error('No OAuth URL returned');
-  }
-}
-
 // Auth
 export const register = (data: unknown) =>
   withFallback(

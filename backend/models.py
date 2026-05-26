@@ -62,10 +62,8 @@ class Tenant(Base):
     email = Column(String(255), unique=True, index=True, nullable=False)
     phone = Column(String(50), nullable=True)
 
-    # MoySklad OAuth
+    # MoySklad: permanent access token (pasted from MoySklad UI). No OAuth.
     moysklad_access_token = Column(Text, nullable=True)
-    moysklad_refresh_token = Column(Text, nullable=True)
-    moysklad_token_expires = Column(DateTime, nullable=True)
     moysklad_account_id = Column(String(100), nullable=True)
 
     # Sales Doctor API (JSON-RPC login/token auth)
