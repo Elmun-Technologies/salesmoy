@@ -11,11 +11,6 @@ import {
   Wallet,
 } from 'lucide-react';
 import {
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  CartesianGrid,
   Tooltip,
   ResponsiveContainer,
   PieChart,
@@ -95,7 +90,6 @@ export default function Dashboard() {
   });
   const [statusData, setStatusData] = useState<{name: string; value: number}[]>([]);
   const [agentSales, setAgentSales] = useState<any[]>([]);
-  const [monthlyRevenue, setMonthlyRevenue] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
   // Whenever the user picks a date, fetch that day's orders live from MoySklad.
@@ -205,16 +199,6 @@ export default function Dashboard() {
         });
         setStatusData(statusCounts);
         setAgentSales(agents);
-
-        // Monthly revenue mock (until we have historical data)
-        setMonthlyRevenue([
-          { month: 'Авг', revenue: 320000000, profit: 64000000 },
-          { month: 'Сен', revenue: 380000000, profit: 76000000 },
-          { month: 'Окт', revenue: 410000000, profit: 82000000 },
-          { month: 'Ноя', revenue: 450000000, profit: 90000000 },
-          { month: 'Дек', revenue: 470000000, profit: 94000000 },
-          { month: 'Янв', revenue: totalRevenue || 487500000, profit: Math.round((totalRevenue || 487500000) * 0.2) },
-        ]);
       } catch (e) {
         console.error('Dashboard load error:', e);
       } finally {
@@ -302,29 +286,7 @@ export default function Dashboard() {
         />
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ delay: 0.4 }}
-          className="lg:col-span-2 bg-white rounded-xl border border-slate-200 p-6 shadow-sm"
-        >
-          <h3 className="text-lg font-semibold text-slate-900 mb-4">Динамика выручки и прибыли</h3>
-          <ResponsiveContainer width="100%" height={300}>
-            <BarChart data={monthlyRevenue}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-              <XAxis dataKey="month" stroke="#64748b" fontSize={12} />
-              <YAxis stroke="#64748b" fontSize={12} tickFormatter={(v) => `${(v as number) / 1000000}M`} />
-              <Tooltip
-                formatter={(value) => [`${formatMoney(Number(value))} сум`, '']}
-                contentStyle={{ borderRadius: 8, border: '1px solid #e2e8f0' }}
-              />
-              <Bar dataKey="revenue" name="Выручка" fill="#10b981" radius={[4, 4, 0, 0]} />
-              <Bar dataKey="profit" name="Прибыль" fill="#3b82f6" radius={[4, 4, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
-        </motion.div>
-
+      <div className="grid grid-cols-1 gap-6">
         <motion.div
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}

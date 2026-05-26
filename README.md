@@ -52,7 +52,7 @@ Menejer **MoySklad** da zakaz yaratganda, u avtomatik ravishda **Sales Doctor** 
 | Kesh / Navbat | Redis 7 |
 | Fon sinxroni | `asyncio` sikllar + `fcntl.flock` lider tanlash |
 | Real-vaqt eventlar | MoySklad webhooklari → `/api/webhook/moysklad` |
-| Autentifikatsiya | JWT (HS256, 7 kunlik tokenlar) + MoySklad OAuth2 |
+| Autentifikatsiya | JWT (HS256, 7 kunlik tokenlar). MoySklad uchun permanent access token |
 | Multi-tenancy | Satr darajasida izolyatsiya (har bir jadvalda `tenant_id`) |
 | Frontend | React 19, Vite, Tailwind CSS 4, Recharts |
 | Reverse Proxy | Nginx + Traefik (Let's Encrypt TLS) |
@@ -73,7 +73,7 @@ Menejer **MoySklad** da zakaz yaratganda, u avtomatik ravishda **Sales Doctor** 
 - **httpx** — MoySklad va Sales Doctor API lari uchun async HTTP client
 - **tenacity** — barcha API chaqiruvlarida qayta urinish (3 ta urinish, eksponensial kutish)
 - **passlib + bcrypt** — parol hashlash
-- **PyJWT** — kirish tokenlari va OAuth state tokenlari
+- **PyJWT** — kirish tokenlari
 - **pydantic-settings** — `.env` dan type-safe konfiguratsiya
 
 ### Frontend
@@ -104,7 +104,7 @@ Menejer **MoySklad** da zakaz yaratganda, u avtomatik ravishda **Sales Doctor** 
 
 ### Multi-Tenancy
 - Har bir tenant to'liq ajratilgan ma'lumotlarga ega — cross-tenant ma'lumot sızıntısı yo'q
-- Har bir tenant uchun alohida MoySklad OAuth tokeni, Sales Doctor credential va filial ID
+- Har bir tenant uchun alohida MoySklad permanent token, Sales Doctor credential va filial ID
 - `moysklad_account_id` bo'yicha webhook marshrutlash — har bir tenant eventlari faqat o'z pipeliniga boradi
 - **Webhooklarni avtomatik ro'yxatdan o'tkazish** — tenant MoySklad ni ulashida webhooklar avtomatik ro'yxatdan o'tadi
 
@@ -173,7 +173,7 @@ Har 60 sekundda har bir tenant uchun
 │   ├── Dockerfile
 │   ├── .env.example
 │   ├── routers/
-│   │   ├── auth.py              # Ro'yxatdan o'tish, login, MoySklad OAuth, SD ulash
+│   │   ├── auth.py              # Ro'yxatdan o'tish, login, MoySklad va SD ulash
 │   │   ├── orders.py            # Zakaz CRUD + status yangilash
 │   │   ├── stock.py             # Sklad qoldiqlari API
 │   │   ├── clients.py           # Klient boshqaruvi
@@ -186,10 +186,9 @@ Har 60 sekundda har bir tenant uchun
 │   ├── services/
 │   │   ├── sync.py              # SyncService — barcha sinxron logikasi
 │   │   ├── moysklad.py          # MoySkladClient (httpx + tenacity)
-│   │   ├── salesdoctor.py       # SalesDoctorClient (JSON-RPC + tenacity)
-│   │   └── moysklad_oauth.py    # OAuth2 token almashinuvi
+│   │   └── salesdoctor.py       # SalesDoctorClient (JSON-RPC + tenacity)
 │   ├── security/
-│   │   └── jwt_tokens.py        # Kirish + OAuth state tokenlarini yaratish/dekod
+│   │   └── jwt_tokens.py        # Kirish tokenlarini yaratish/dekod
 │   └── middleware/
 │       └── tenant.py            # JWT → request.state.tenant_id
 ├── src/                         # React frontend
@@ -250,12 +249,8 @@ UI: http://localhost:5173
 | `DATABASE_URL` | ✅ | `sqlite+aiosqlite:///./integration.db` (dev) yoki `postgresql+asyncpg://...` (prod) |
 | `REDIS_URL` | ✅ | `redis://localhost:6379/0` |
 | `PUBLIC_BASE_URL` | ✅ prod | Ushbu serverning HTTPS URL — MoySklad webhooklarini avtomatik ro'yxatdan o'tkazish uchun |
-| `FRONTEND_BASE_URL` | ✅ | OAuth dan so'ng foydalanuvchi shu yerga yo'naltiriladi |
 | `CORS_ORIGINS` | ✅ | Vergul bilan ajratilgan ruxsat etilgan originlar |
-| `MOYSKLAD_CLIENT_ID` | Faqat OAuth | MoySklad Marketplace ilova Client ID |
-| `MOYSKLAD_CLIENT_SECRET` | Faqat OAuth | MoySklad Marketplace ilova Client Secret |
-| `MOYSKLAD_REDIRECT_URI` | Faqat OAuth | MoySklad developer konsolindagi sozlamalar bilan mos kelishi kerak |
-| `MOYSKLAD_TOKEN` | Faqat dev | Ishlab chiqish/test uchun global token |
+| `MOYSKLAD_TOKEN` | Faqat dev | Ishlab chiqish/test uchun global token (prod'da har tenant o'z tokenini Sozlamalarda joylashtiradi) |
 | `MOYSKLAD_BASE_URL` | | Standart: `https://api.moysklad.ru/api/remap/1.2` |
 | `STOCK_SYNC_INTERVAL` | | Sklad sinxronlari orasidagi soniyalar. Standart: `60` |
 | `DEBT_SYNC_INTERVAL` | | Qarz sinxronlari orasidagi soniyalar. Standart: `600` |
@@ -279,9 +274,7 @@ UI: http://localhost:5173
 | `POST` | `/api/auth/register` | Yangi kompaniya ro'yxatdan o'tkazish — tenant + admin yaratadi |
 | `POST` | `/api/auth/login` | Email/parol bilan kirish → JWT |
 | `GET` | `/api/auth/me` | Joriy tenant ma'lumotlari |
-| `GET` | `/api/auth/moysklad/authorize-url` | MoySklad OAuth URL ni olish (Marketplace) |
-| `GET` | `/api/auth/moysklad/callback` | OAuth callback — token saqlaydi + webhooklarni avtomatik ro'yxatdan o'tkazadi |
-| `POST` | `/api/auth/connect/moysklad` | Token qo'lda kiritish — saqlaydi + webhooklarni avtomatik ro'yxatdan o'tkazadi |
+| `POST` | `/api/auth/connect/moysklad` | MoySklad permanent token saqlash + webhooklarni avtomatik ro'yxatdan o'tkazish |
 | `POST` | `/api/auth/connect/salesdoctor` | Sales Doctor ni login/parol bilan ulash |
 
 ### Zakazlar
@@ -371,13 +364,10 @@ POST /api/auth/register
 → 14 kunlik bepul sinov avtomatik boshlanadi
 
 2-qadam — MoySklad ulash
-A variant (OAuth): GET /api/auth/moysklad/authorize-url
-  → URL ni brauzerda oching → foydalanuvchi tasdiqlaydi
-  → callback webhooklarni avtomatik ro'yxatdan o'tkazadi
-
-B variant (Token): POST /api/auth/connect/moysklad
-  { "access_token": "Bearer ms-tokeningiz" }
-  → Webhooklar darhol ro'yxatdan o'tadi
+MoySklad UI > Sozlamalar > Access tokens'da permanent token oling, keyin:
+POST /api/auth/connect/moysklad
+  { "access_token": "ms-permanent-tokeningiz" }
+  → Webhooklar darhol avtomatik ro'yxatdan o'tadi
 
 3-qadam — Sales Doctor ulash
 POST /api/auth/connect/salesdoctor
@@ -453,11 +443,7 @@ DATABASE_URL=postgresql+asyncpg://integration_user:PAROL@db:5432/integration
 DB_PASSWORD=<kuchli-db-paroli>
 REDIS_URL=redis://redis:6379/0
 PUBLIC_BASE_URL=https://app.pipely.uz
-FRONTEND_BASE_URL=https://app.pipely.uz
 CORS_ORIGINS=https://app.pipely.uz
-MOYSKLAD_CLIENT_ID=<ms-ilova-client-id>
-MOYSKLAD_CLIENT_SECRET=<ms-ilova-client-secret>
-MOYSKLAD_REDIRECT_URI=https://app.pipely.uz/api/auth/moysklad/callback
 DEBUG=false
 ```
 

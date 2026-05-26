@@ -14,6 +14,7 @@ from config import get_settings
 from database import get_db
 from models import Tenant, User
 from security.jwt_tokens import create_access_token
+from security.secret_box import encrypt_secret
 
 logger = logging.getLogger(__name__)
 
@@ -302,7 +303,7 @@ async def connect_salesdoctor(
     from datetime import datetime as _dt
     tenant.salesdoctor_base_url = data.base_url
     tenant.salesdoctor_login = data.login
-    tenant.salesdoctor_password = data.password
+    tenant.salesdoctor_password = encrypt_secret(data.password)
     tenant.salesdoctor_user_id = creds["userId"]
     tenant.salesdoctor_token = creds["token"]
     tenant.salesdoctor_filial_id = data.filial_id

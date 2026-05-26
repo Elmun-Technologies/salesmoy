@@ -102,9 +102,10 @@ CORS_ORIGINS=https://your-domain.com
 DATABASE_URL=postgresql+asyncpg://integration_user:strong_password@db:5432/integration
 REDIS_URL=redis://redis:6379/0
 
-MOYSKLAD_CLIENT_ID=your-moysklad-app-id
-MOYSKLAD_CLIENT_SECRET=your-moysklad-app-secret
-MOYSKLAD_REDIRECT_URI=https://api.your-domain.com/api/auth/moysklad/callback
+PUBLIC_BASE_URL=https://api.your-domain.com
+
+# MoySklad permanent access token har bir tenant Sozlamalarda joylashtiriladi —
+# bu yerda hech narsa yozish kerakmas.
 
 # Payment providers
 PAYME_MERCHANT_ID=your-payme-id

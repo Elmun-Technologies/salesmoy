@@ -48,10 +48,8 @@ services:
       - DEBUG=false
       - TEST_MODE=false
       - CORS_ORIGINS=${CORS_ORIGINS}
-      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL}
-      - MOYSKLAD_CLIENT_ID=${MOYSKLAD_CLIENT_ID}
-      - MOYSKLAD_CLIENT_SECRET=${MOYSKLAD_CLIENT_SECRET}
-      - MOYSKLAD_REDIRECT_URI=${MOYSKLAD_REDIRECT_URI}
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - SD_VERIFY_SSL=${SD_VERIFY_SSL:-false}
     depends_on:
       db:
         condition: service_healthy

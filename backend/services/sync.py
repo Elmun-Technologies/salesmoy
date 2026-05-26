@@ -112,8 +112,9 @@ class SyncService:
         Called by SalesDoctorClient when an auth-shaped error is detected.
         Returns {"userId": ..., "token": ...} on success, None on failure.
         """
+        from security.secret_box import decrypt_secret
         login = (self.tenant.salesdoctor_login or "").strip()
-        password = self.tenant.salesdoctor_password or ""
+        password = decrypt_secret(self.tenant.salesdoctor_password)
         base_url = (self.tenant.salesdoctor_base_url or "").strip()
         if not login or not password or not base_url:
             logger.error(

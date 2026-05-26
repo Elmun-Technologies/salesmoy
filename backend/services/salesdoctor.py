@@ -10,12 +10,32 @@ Status codes (setOrder):
 """
 
 import logging
+import os
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 logger = logging.getLogger(__name__)
+
+# SD's TLS cert often has a hostname mismatch; we disable verification by
+# default and log a warning. Operators who have a working cert (or a custom
+# CA bundle) can set SD_VERIFY_SSL=true (or a path) to enforce it.
+_SD_VERIFY_ENV = os.getenv("SD_VERIFY_SSL", "false").strip()
+
+
+def _sd_verify():
+    if _SD_VERIFY_ENV.lower() in ("true", "1", "yes"):
+        return True
+    if _SD_VERIFY_ENV and _SD_VERIFY_ENV.lower() not in ("false", "0", "no"):
+        # Treat as path to CA bundle
+        return _SD_VERIFY_ENV
+    logger.warning(
+        "SalesDoctor SSL verification DISABLED (SD_VERIFY_SSL=%r). Set "
+        "SD_VERIFY_SSL=true (or a CA bundle path) once the upstream cert is fixed.",
+        _SD_VERIFY_ENV or "false",
+    )
+    return False
 
 # MoySklad status name → Sales Doctor status code
 MS_STATUS_TO_SD: Dict[str, int] = {
@@ -56,10 +76,7 @@ class SalesDoctorClient:
         # If provided, called once when an SD call fails with an auth error.
         # Must return {"userId": ..., "token": ...} or None on failure.
         self._refresh_callback = refresh_callback
-        # Sales Doctor's TLS cert (api.salesdoctor.uz) is misconfigured — hostname
-        # mismatch trips Python's SSL verification. Skip verification so the
-        # integration can talk to the upstream; revisit if/when SD fixes their cert.
-        self._http = httpx.AsyncClient(timeout=30.0, headers=self.HEADERS, verify=False)
+        self._http = httpx.AsyncClient(timeout=30.0, headers=self.HEADERS, verify=_sd_verify())
 
     async def close(self):
         await self._http.aclose()
@@ -190,7 +207,7 @@ class SalesDoctorClient:
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0 (compatible; SalesMoy-Integration/1.0)",
         }
-        async with httpx.AsyncClient(timeout=30.0, verify=False) as http:
+        async with httpx.AsyncClient(timeout=30.0, verify=_sd_verify()) as http:
             try:
                 resp = await http.post(url, json=payload, headers=headers)
                 resp.raise_for_status()
