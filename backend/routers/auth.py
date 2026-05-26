@@ -335,6 +335,8 @@ async def connect_moysklad(
     db: AsyncSession = Depends(get_db),
 ):
     """Paste MoySklad token manually (JSON access_token)."""
+    from services.moysklad import MoySkladClient, MoySkladAuthError, MoySkladError
+
     tenant_id = getattr(request.state, "tenant_id", None)
     if not tenant_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -345,11 +347,33 @@ async def connect_moysklad(
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
+    # Validate token against MoySklad before saving — reject expired/invalid tokens
+    # up front instead of silently storing them and breaking sync later.
+    probe = MoySkladClient(token=data.access_token)
+    try:
+        account_id = await probe.get_account_id()
+    except MoySkladAuthError:
+        await probe.close()
+        raise HTTPException(
+            status_code=400,
+            detail="MoySklad token noto'g'ri yoki muddati o'tgan. Yangi token oling.",
+        )
+    except MoySkladError as e:
+        await probe.close()
+        raise HTTPException(status_code=400, detail=f"MoySklad bilan ulanib bo'lmadi: {e}")
+    finally:
+        await probe.close()
+
+    if not account_id:
+        raise HTTPException(
+            status_code=400,
+            detail="MoySklad token tekshiruvdan o'tmadi (accountId topilmadi). Tokenni qayta tekshiring.",
+        )
+
     tenant.moysklad_access_token = data.access_token
     tenant.moysklad_refresh_token = data.refresh_token
     tenant.moysklad_token_expires = datetime.utcnow() + timedelta(seconds=data.expires_in)
-    if data.account_id:
-        tenant.moysklad_account_id = data.account_id
+    tenant.moysklad_account_id = data.account_id or account_id
 
     await db.commit()
 

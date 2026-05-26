@@ -136,17 +136,27 @@ export const login = (data: unknown) =>
 export const getMe = () =>
   withFallback(() => fetchJson('/api/auth/me'), () => mock.mockGetMe());
 
+// Credential connect endpoints must NEVER fall back to a fake "success" —
+// silently pretending the token was saved hides real network/auth failures
+// and leaves the user thinking the integration is wired up when it isn't.
+async function callRealOnly(path: string, body: unknown) {
+  try {
+    return await fetchJson(path, { method: 'POST', body: JSON.stringify(body) });
+  } catch (e: any) {
+    if (e?.message === 'MOCK_MODE') {
+      throw new Error(
+        "Serverga ulanib bo'lmadi. API manzilini tekshiring (Sozlamalar > API URL) va internetni qayta sinab ko'ring."
+      );
+    }
+    throw e;
+  }
+}
+
 export const connectMoySklad = (data: unknown) =>
-  withFallback(
-    () => fetchJson('/api/auth/connect/moysklad', { method: 'POST', body: JSON.stringify(data) }),
-    () => Promise.resolve({ success: true })
-  );
+  callRealOnly('/api/auth/connect/moysklad', data);
 
 export const connectSalesDoctor = (data: unknown) =>
-  withFallback(
-    () => fetchJson('/api/auth/connect/salesdoctor', { method: 'POST', body: JSON.stringify(data) }),
-    () => Promise.resolve({ success: true })
-  );
+  callRealOnly('/api/auth/connect/salesdoctor', data);
 
 // MoySklad webhooks (real-time sync)
 export const getMoySkladWebhookStatus = () =>
