@@ -139,13 +139,29 @@ class MoySkladClient:
             "phone": phone,
         }
         payload.update(kwargs)
+        self._coerce_address_fields(payload)
         return await self._request("POST", "/entity/counterparty", json_data=payload)
 
     async def update_counterparty(self, counterparty_id: str, **kwargs) -> Dict:
         """Update counterparty."""
+        self._coerce_address_fields(kwargs)
         return await self._request(
             "PUT", f"/entity/counterparty/{counterparty_id}", json_data=kwargs
         )
+
+    @staticmethod
+    def _coerce_address_fields(payload: Dict[str, Any]) -> None:
+        """Force address fields to plain strings in-place.
+
+        MoySklad rejects non-string actualAddress/legalAddress with
+        error_2016 ("значение поля не соответствует типу строка").
+        SalesDoctor sometimes sends these as objects or null, so coerce
+        anything that isn't already a string down to an empty string.
+        """
+        for field in ("actualAddress", "legalAddress"):
+            if field in payload and not isinstance(payload[field], str):
+                payload[field] = ""
+
 
     # ========== Products (Stock) ==========
 

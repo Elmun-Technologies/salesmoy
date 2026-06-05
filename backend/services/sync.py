@@ -672,7 +672,9 @@ class SyncService:
 
                 # Ensure client exists in SD before pushing order, with address + GPS + agent
                 client_code = client_phone or client_name
+                client_ready = True
                 if client_code:
+                    client_ready = False
                     try:
                         category = await self._get_sd_category_id("retail")
                         sd_client = self._build_sd_client(
@@ -685,8 +687,18 @@ class SyncService:
                             agent=agent_ref,
                         )
                         await self.sd.set_client([sd_client])
+                        client_ready = True
                     except Exception as e:
                         logger.warning("Pre-order setClient failed for %s: %s", client_code, e)
+
+                if not client_ready:
+                    # The client isn't in SD yet — calling setOrder now would
+                    # fail with "Клиент не найден". Leave the order PENDING so
+                    # the retry cycle re-attempts after the bulk client sync
+                    # establishes this client in SD.
+                    order.sync_status = SyncStatus.PENDING
+                    await self.db.commit()
+                    return order
 
                 order_products = [
                     {
@@ -1100,7 +1112,11 @@ class SyncService:
                 )
                 await self.sd.set_client([sd_client])
             except Exception as e:
-                logger.warning("Pre-order setClient failed for %s: %s", client_code, e)
+                # Don't push the order if the client couldn't be established —
+                # setOrder would fail with "Клиент не найден". Raise so the
+                # caller keeps this order in the retry pool; a later cycle
+                # (after the client lands in SD) succeeds.
+                raise RuntimeError(f"client {client_code} not ready in SD: {e}")
 
         order_products = [
             {
