@@ -781,22 +781,21 @@ class SyncService:
             lookback = max(1, _gs().initial_order_lookback_days)
             end = datetime.utcnow()
             start = end - _td(days=lookback)
-            # Paginated + expanded list. The previous implementation called
-            # get_customer_orders(limit=100) with no pagination, so any day
-            # with >100 orders silently lost the older ones — they never
-            # reached our DB, and never reached SalesDoctor.
-            ms_orders = await self.ms.get_customer_orders_in_range(start, end, expand=True)
+            # Paginated list for DISCOVERY only. MoySklad's list endpoint
+            # returns a shallow agent (meta href only) even with expand=agent,
+            # so we must fetch each NEW order individually below to get the
+            # full counterparty (name/phone/address) — without it the order
+            # reaches SD with an empty client code and fails "Клиент не найден".
+            ms_orders = await self.ms.get_customer_orders_in_range(start, end, expand=False)
             synced = 0
             skipped = 0
 
-            for ms_order_full in ms_orders:
-                ms_id = ms_order_full.get("id", "")
+            for ms_brief in ms_orders:
+                ms_id = ms_brief.get("id", "")
                 if not ms_id:
                     continue
 
-                # Skip if already in DB (process_moysklad_order also checks,
-                # but the explicit skip avoids spurious commits and lets us
-                # report an accurate "already in DB" count).
+                # Skip if already in DB — avoids re-fetching/re-processing.
                 result = await self.db.execute(
                     select(Order).where(
                         Order.tenant_id == self.tenant.id,
@@ -808,6 +807,9 @@ class SyncService:
                     continue
 
                 try:
+                    # Full fetch — expands the agent so client name/phone/
+                    # address are populated (the list item only has meta).
+                    ms_order_full = await self.ms.get_customer_order_with_positions(ms_id)
                     order = await self.process_moysklad_order(ms_order_full)
                     if order:
                         synced += 1
@@ -1098,6 +1100,13 @@ class SyncService:
         )
         client_lat_lon = self._extract_gps_from_ms_counterparty(agent_data)
         agent_ref = await self._resolve_agent_for_ms_owner(client_owner)
+
+        # Backfill client fields on the DB row when they were imported empty
+        # (orders created from the shallow list had no counterparty data).
+        if client_name and not order.client_name:
+            order.client_name = client_name
+        if client_phone and not order.client_phone:
+            order.client_phone = client_phone
 
         items: List[Dict] = []
         positions_block = ms_order.get("positions", {})
