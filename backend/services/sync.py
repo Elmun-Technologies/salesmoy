@@ -742,9 +742,18 @@ class SyncService:
                 order.sync_status = SyncStatus.SYNCED
                 order.synced_at = datetime.utcnow()
             except Exception as e:
-                order.sync_status = SyncStatus.ERROR
-                await self.log(LogType.ERROR, "Order Sync",
-                               f"setOrder failed for {order_name}: {e}")
+                if self._is_client_not_ready_error(e):
+                    # SD accepted setClient but hasn't made the client
+                    # queryable yet (eventual consistency). Defer as PENDING
+                    # so the retry cycle re-pushes once the client lands,
+                    # instead of burning the order as a hard ERROR.
+                    order.sync_status = SyncStatus.PENDING
+                    await self.log(LogType.INFO, "Order Sync",
+                                   f"Order {order_name} deferred — client not in SD yet, will retry")
+                else:
+                    order.sync_status = SyncStatus.ERROR
+                    await self.log(LogType.ERROR, "Order Sync",
+                                   f"setOrder failed for {order_name}: {e}")
 
         await self.db.commit()
         # Only log SUCCESS if order actually reached Sales Doctor
@@ -872,6 +881,10 @@ class SyncService:
             except Exception as e:
                 logger.warning("Retry failed for order %s: %s", order_id_str, e)
                 still_failed += 1
+                # "Client not ready" is transient (SD eventual consistency) —
+                # keep the order PENDING so it keeps draining. Other failures
+                # are marked ERROR (still retried, but visible as failures).
+                deferred = self._is_client_not_ready_error(e)
                 try:
                     await self.db.rollback()
                 except Exception:
@@ -880,7 +893,9 @@ class SyncService:
                 try:
                     fresh = await self.db.get(Order, order.id)
                     if fresh:
-                        fresh.sync_status = SyncStatus.ERROR
+                        fresh.sync_status = (
+                            SyncStatus.PENDING if deferred else SyncStatus.ERROR
+                        )
                         await self.db.commit()
                 except Exception:
                     try:
@@ -1717,6 +1732,18 @@ class SyncService:
                     return ref
 
         return await self._get_sd_default_agent()
+
+    @staticmethod
+    def _is_client_not_ready_error(e: Exception) -> bool:
+        """True when an SD order push failed because the client isn't in SD yet.
+
+        SD's setClient is eventually consistent — it accepts the client but
+        an immediately-following setOrder may report "Клиент не найден" until
+        SD commits it. We treat this as a transient/deferrable condition
+        rather than a hard error.
+        """
+        msg = str(e).lower()
+        return "не найден" in msg or "not found" in msg
 
     @staticmethod
     def _ms_address(cp: Dict) -> str:
