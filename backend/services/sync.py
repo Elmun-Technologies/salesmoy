@@ -732,6 +732,11 @@ class SyncService:
                     sd_order["address"] = delivery_address
                 if agent_ref:
                     sd_order["agent"] = agent_ref
+                # Send the MoySklad order time so SD shows the same date,
+                # not its own receive time.
+                sd_date = self._sd_order_date(ms_moment)
+                if sd_date:
+                    sd_order["date"] = sd_date
                 order_defaults = await self._get_sd_order_defaults()
                 if order_defaults.get("priceType"):
                     sd_order["priceType"] = order_defaults["priceType"]
@@ -1171,6 +1176,10 @@ class SyncService:
             sd_order["address"] = delivery_address
         if agent_ref:
             sd_order["agent"] = agent_ref
+        # Send the MoySklad order time so SD shows the same date.
+        sd_date = self._sd_order_date(ms_order.get("moment"))
+        if sd_date:
+            sd_order["date"] = sd_date
         order_defaults = await self._get_sd_order_defaults()
         if order_defaults.get("priceType"):
             sd_order["priceType"] = order_defaults["priceType"]
@@ -1741,6 +1750,27 @@ class SyncService:
                     return ref
 
         return await self._get_sd_default_agent()
+
+    @staticmethod
+    def _sd_order_date(ms_moment: Optional[str]) -> Optional[str]:
+        """Convert a MoySklad order `moment` (UTC) into the date string to send
+        to SalesDoctor, shifted by the configured offset so SD shows the same
+        time MoySklad's UI displays. Returns None if the moment is unparseable.
+        """
+        if not ms_moment:
+            return None
+        from config import get_settings as _gs
+        dt = None
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+            try:
+                dt = datetime.strptime(ms_moment, fmt)
+                break
+            except (TypeError, ValueError):
+                continue
+        if dt is None:
+            return None
+        dt += timedelta(hours=_gs().salesdoctor_order_date_offset_hours)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
 
     @staticmethod
     def _is_client_not_ready_error(e: Exception) -> bool:

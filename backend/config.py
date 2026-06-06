@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     # MoySklad prices are in USD, Sales Doctor expects UZS
     usd_to_uzs_rate: float = 12695  # Example: 1 USD = 12,695 UZS
 
+    # Hours to add to the MoySklad order `moment` (UTC) before sending it to
+    # SalesDoctor as the order date. Without an explicit date, SD stamps its
+    # own receive time, which differs from what MoySklad's UI shows. Set this
+    # to the offset between UTC and MoySklad's displayed timezone so the two
+    # systems show the SAME order time. (MoySklad UI here displays UTC+2.)
+    salesdoctor_order_date_offset_hours: int = 2
+
     # Webhook
     webhook_secret: str = ""
     webhook_url: str = ""
