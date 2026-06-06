@@ -137,29 +137,29 @@ async def moysklad_webhook(
             continue
 
         if "customerorder" in entity_type:
-            if action == "CREATE":
-                # New order in MoySklad → fetch full order → save & push to Sales Doctor
+            if action in ("CREATE", "UPDATE"):
+                # MoySklad's newer webhook delivery sends UPDATE for newly
+                # created orders too (not just CREATE), so handle both the
+                # same way: fetch the full order and run it through
+                # process_moysklad_order, which is idempotent (it returns
+                # early when the order is already in our DB). For orders
+                # we already have, also propagate state changes when the
+                # update touched the `state` field.
                 try:
                     if service.ms:
                         ms_order = await service.ms.get_customer_order_with_positions(entity_id)
-                        await service.process_moysklad_order(ms_order)
+                        created = await service.process_moysklad_order(ms_order)
+                        if created is None and action == "UPDATE":
+                            # Already in DB — handle status transitions.
+                            updated_fields = evt.get("updatedFields", [])
+                            if "state" in updated_fields:
+                                state = ms_order.get("state", {})
+                                state_name = state.get("name", "") if isinstance(state, dict) else ""
+                                if state_name:
+                                    await service.update_order_status_from_moysklad(entity_id, state_name)
                 except Exception as e:
-                    logger.error("Failed to process new MoySklad order %s: %s", entity_id, e)
-                    await service.log(LogType.ERROR, "Webhook", f"New order processing failed: {e}")
-
-            elif action == "UPDATE":
-                updated_fields = evt.get("updatedFields", [])
-                if "state" in updated_fields:
-                    try:
-                        if service.ms:
-                            # Use expanded fetch so state.name is available (not just meta href)
-                            ms_order = await service.ms.get_customer_order_with_positions(entity_id)
-                            state = ms_order.get("state", {})
-                            state_name = state.get("name", "") if isinstance(state, dict) else ""
-                            if state_name:
-                                await service.update_order_status_from_moysklad(entity_id, state_name)
-                    except Exception as e:
-                        logger.error("Failed to update order status %s: %s", entity_id, e)
+                    logger.error("Failed to process MoySklad order %s (%s): %s", entity_id, action, e)
+                    await service.log(LogType.ERROR, "Webhook", f"Order {action} processing failed: {e}")
 
         elif "counterparty" in entity_type:
             # Mijoz MS'da yaratildi/yangilandi → SD'ga push (yangi GPS bilan ham)
