@@ -892,19 +892,25 @@ class SyncService:
                 # keep the order PENDING so it keeps draining. Other failures
                 # are marked ERROR (still retried, but visible as failures).
                 deferred = self._is_client_not_ready_error(e)
+                new_status = SyncStatus.PENDING if deferred else SyncStatus.ERROR
+                # Use raw SQL after rollback to avoid greenlet_spawn errors
+                # from ORM session state issues — ORM autoflush on a tainted
+                # session can blow up here. Plain SQL bypasses that entirely.
                 try:
                     await self.db.rollback()
                 except Exception:
                     pass
-                # Re-load to avoid DetachedInstanceError after rollback.
                 try:
-                    fresh = await self.db.get(Order, order.id)
-                    if fresh:
-                        fresh.sync_status = (
-                            SyncStatus.PENDING if deferred else SyncStatus.ERROR
+                    from sqlalchemy import update as sa_update
+                    await self.db.execute(
+                        sa_update(Order).where(Order.id == order.id).values(
+                            sync_status=new_status
                         )
-                        await self.db.commit()
-                except Exception:
+                    )
+                    await self.db.commit()
+                except Exception as upd_err:
+                    logger.warning("Could not mark order %s as %s: %s",
+                                   order_id_str, new_status.value, upd_err)
                     try:
                         await self.db.rollback()
                     except Exception:
