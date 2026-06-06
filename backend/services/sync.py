@@ -636,6 +636,12 @@ class SyncService:
                     break
                 except (TypeError, ValueError):
                     continue
+            # MoySklad's moment is in account-local time (e.g. UTC+3 / Moscow).
+            # Convert to true UTC so created_at is comparable with NOW() and
+            # the rest of our timestamps.
+            if order_created_at is not None:
+                from config import get_settings as _gs
+                order_created_at -= timedelta(hours=_gs().moysklad_account_utc_offset_hours)
 
         order = Order(
             tenant_id=self.tenant.id,

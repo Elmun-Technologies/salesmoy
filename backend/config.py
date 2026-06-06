@@ -51,12 +51,19 @@ class Settings(BaseSettings):
     # MoySklad prices are in USD, Sales Doctor expects UZS
     usd_to_uzs_rate: float = 12695  # Example: 1 USD = 12,695 UZS
 
-    # Hours to add to the MoySklad order `moment` (UTC) before sending it to
-    # SalesDoctor as the order date. Without an explicit date, SD stamps its
-    # own receive time, which differs from what MoySklad's UI shows. Set this
-    # to the offset between UTC and MoySklad's displayed timezone so the two
-    # systems show the SAME order time. (MoySklad UI here displays UTC+2.)
-    salesdoctor_order_date_offset_hours: int = 2
+    # MoySklad API returns the order `moment` as a naive timestamp in the
+    # account's configured timezone (Moscow / UTC+3 by default). Subtract
+    # this many hours when parsing so we store true UTC in created_at —
+    # otherwise the dashboard's "today" filter, our retention windows, and
+    # the polling start/end all drift by the offset. Set to 0 if the
+    # MoySklad account timezone is already UTC.
+    moysklad_account_utc_offset_hours: int = 3
+
+    # Hours to add to the stored (UTC) order time before sending it to
+    # SalesDoctor as the order date. SD stamps its own receive time by
+    # default; this offset lets us send a stable wall-clock value if SD ever
+    # honours the explicit `date` field.
+    salesdoctor_order_date_offset_hours: int = 5
 
     # Webhook
     webhook_secret: str = ""
