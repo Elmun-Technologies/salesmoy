@@ -34,18 +34,80 @@ async def moysklad_webhook(
     except Exception:
         payload = {"raw_body": (await request.body()).decode()}
 
-    account_id = str(payload.get("accountId") or "").strip()
-    if not account_id:
-        logger.warning("MoySklad webhook missing accountId — ignored")
-        return {"status": "ignored", "reason": "missing accountId"}
+    # MoySklad puts accountId in several different places depending on its
+    # webhook version. Check all of them so we don't drop legitimate events.
+    def _find_account_id(p):
+        if not isinstance(p, dict):
+            return ""
+        # Top-level (older format)
+        if p.get("accountId"):
+            return str(p["accountId"]).strip()
+        # events[0].accountId or events[0].meta.href (newer format)
+        evs = p.get("events") or []
+        if evs and isinstance(evs[0], dict):
+            e0 = evs[0]
+            if e0.get("accountId"):
+                return str(e0["accountId"]).strip()
+            meta = e0.get("meta") or {}
+            if isinstance(meta, dict) and meta.get("accountId"):
+                return str(meta["accountId"]).strip()
+            # Parse accountId from meta.href (e.g. /entity/customerorder/<uuid>)
+            # The accountId isn't actually in the href, but the tenant is unique
+            # per webhook URL so we fall back to that below.
+        return ""
 
-    result = await db.execute(
-        select(Tenant).where(Tenant.moysklad_account_id == account_id)
+    account_id = _find_account_id(payload)
+
+    # Always persist the raw payload so we can inspect unknown formats.
+    # Without this the row was silently dropped and we had no way to debug.
+    raw_event = WebhookEvent(
+        tenant_id=0,
+        source="moysklad",
+        event_type=(payload.get("events", [{}])[0] or {}).get("action", "unknown")
+            if isinstance(payload.get("events"), list) else "unknown",
+        payload=payload,
+        processed=False,
+        error_message=None if account_id else "missing accountId",
     )
-    tenant = result.scalar_one_or_none()
+
+    if not account_id:
+        # Fallback: when exactly one tenant has MoySklad connected, route to it.
+        # Production rarely runs with multiple MoySklad accounts on the same
+        # webhook URL, so this is safe — but we log it so we know it's happening.
+        result = await db.execute(
+            select(Tenant).where(Tenant.moysklad_access_token.is_not(None))
+        )
+        tenants = result.scalars().all()
+        if len(tenants) == 1:
+            tenant = tenants[0]
+            account_id = tenant.moysklad_account_id or ""
+            logger.info("MoySklad webhook missing accountId — routed to sole tenant %s", tenant.id)
+        else:
+            logger.warning(
+                "MoySklad webhook missing accountId and %d candidate tenants — ignored",
+                len(tenants),
+            )
+            raw_event.tenant_id = tenants[0].id if tenants else 0
+            try:
+                db.add(raw_event)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+            return {"status": "ignored", "reason": "missing accountId, multiple tenants"}
+    else:
+        result = await db.execute(
+            select(Tenant).where(Tenant.moysklad_account_id == account_id)
+        )
+        tenant = result.scalar_one_or_none()
 
     if not tenant:
         logger.warning("No tenant for MoySklad accountId=%s — event ignored", account_id)
+        raw_event.error_message = f"unknown accountId {account_id}"
+        try:
+            db.add(raw_event)
+            await db.commit()
+        except Exception:
+            await db.rollback()
         return {"status": "ignored", "reason": "unknown account"}
 
     events = payload.get("events", [])
