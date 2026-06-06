@@ -286,9 +286,24 @@ async def moysklad_webhook(
             except Exception as e:
                 await service.log(LogType.ERROR, "Webhook", f"Demand {action} failed: {e}")
 
-    event.processed = True
-    event.processed_at = datetime.utcnow()
-    await db.commit()
+    # Mark processed via raw SQL to avoid ORM session edge cases that
+    # surfaced as 500 errors when a sync method inside the loop tainted
+    # the session state. Plain UPDATE doesn't care about ORM instance state.
+    try:
+        from sqlalchemy import update as sa_update
+        await db.execute(
+            sa_update(WebhookEvent).where(WebhookEvent.id == event.id).values(
+                processed=True,
+                processed_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+    except Exception as e:
+        logger.warning("Could not mark webhook event %s processed: %s", getattr(event, "id", None), e)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
 
     return {"status": "ok"}
 
