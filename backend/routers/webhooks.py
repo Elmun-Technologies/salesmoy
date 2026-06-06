@@ -179,7 +179,6 @@ async def moysklad_webhook(
                         # Local DB ga upsert
                         from sqlalchemy import select as sa_select
                         from models import Client, ClientType
-                        from datetime import datetime
                         local = None
                         if cp_phone:
                             r = await service.db.execute(sa_select(Client).where(
