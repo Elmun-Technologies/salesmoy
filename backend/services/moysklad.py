@@ -241,11 +241,16 @@ class MoySkladClient:
     ) -> List[Dict]:
         """Fetch all orders with moment in [start, end). Paginates through all pages.
 
-        MoySklad's `moment` filter uses the account's local time (no timezone).
-        Caller is responsible for passing the right boundaries.
+        MoySklad's `moment` filter compares against the account-local time of
+        the order, not UTC. Callers pass UTC datetimes; we add the configured
+        account offset before formatting so the filter actually matches what
+        the account stores.
         """
-        s = start.strftime("%Y-%m-%d %H:%M:%S")
-        e = end.strftime("%Y-%m-%d %H:%M:%S")
+        from config import get_settings as _gs
+        from datetime import timedelta as _td
+        offset_h = _gs().moysklad_account_utc_offset_hours
+        s = (start + _td(hours=offset_h)).strftime("%Y-%m-%d %H:%M:%S")
+        e = (end + _td(hours=offset_h)).strftime("%Y-%m-%d %H:%M:%S")
         all_rows: List[Dict] = []
         offset = 0
         limit = 1000
