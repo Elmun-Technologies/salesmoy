@@ -73,9 +73,16 @@ async def _patch_schema():
             ))
 
         elif dialect == "postgresql":
-            await conn.execute(
-                text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS plan_slug VARCHAR(50)")
+            # `payments` has no ORM model, so create_all never creates it on a
+            # fresh database. Only patch it when it already exists (older DBs) —
+            # otherwise ALTER TABLE raises UndefinedTableError and boot fails.
+            has_payments = await conn.execute(
+                text("SELECT to_regclass('public.payments')")
             )
+            if has_payments.scalar() is not None:
+                await conn.execute(
+                    text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS plan_slug VARCHAR(50)")
+                )
             pg_new = {
                 "salesdoctor_base_url": "VARCHAR(255)",
                 "salesdoctor_login": "VARCHAR(255)",
