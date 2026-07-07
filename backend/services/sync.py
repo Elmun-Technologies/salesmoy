@@ -879,12 +879,24 @@ class SyncService:
         if not orders_to_retry:
             return
 
+        # Snapshot the fields we need now, while the session is clean. A rollback
+        # later in the loop expires every ORM attribute; re-reading order.id /
+        # order.moysklad_id afterwards triggers a lazy load that raises
+        # greenlet_spawn — which propagated out of the loop and stalled the whole
+        # sync, letting one un-pushable order (e.g. out of stock in SD) block
+        # every other pending order. Work from primitives + a fresh per-iteration
+        # fetch so a single bad order can't poison the rest.
+        snapshots = [(o.id, o.moysklad_id, o.order_id) for o in orders_to_retry]
+
         retried = 0
         still_failed = 0
-        for order in orders_to_retry:
-            order_id_str = order.order_id or str(order.id)
+        for oid, ms_id, ord_name in snapshots:
+            order_id_str = ord_name or str(oid)
             try:
-                ms_order_full = await self.ms.get_customer_order_with_positions(order.moysklad_id)
+                order = await self.db.get(Order, oid)
+                if order is None:
+                    continue
+                ms_order_full = await self.ms.get_customer_order_with_positions(ms_id)
                 await self._push_order_to_sd(order, ms_order_full)
                 order.sync_status = SyncStatus.SYNCED
                 order.synced_at = datetime.utcnow()
@@ -899,9 +911,8 @@ class SyncService:
                 # are marked ERROR (still retried, but visible as failures).
                 deferred = self._is_client_not_ready_error(e)
                 new_status = SyncStatus.PENDING if deferred else SyncStatus.ERROR
-                # Use raw SQL after rollback to avoid greenlet_spawn errors
-                # from ORM session state issues — ORM autoflush on a tainted
-                # session can blow up here. Plain SQL bypasses that entirely.
+                # Reset the session, then mark status by primary key (never via an
+                # expired ORM attribute) so this can't itself raise greenlet_spawn.
                 try:
                     await self.db.rollback()
                 except Exception:
@@ -909,7 +920,7 @@ class SyncService:
                 try:
                     from sqlalchemy import update as sa_update
                     await self.db.execute(
-                        sa_update(Order).where(Order.id == order.id).values(
+                        sa_update(Order).where(Order.id == oid).values(
                             sync_status=new_status
                         )
                     )
